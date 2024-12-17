@@ -1,0 +1,3529 @@
+<File: .gitignore>
+.venv/
+.env
+ragtest
+chat.py
+graphrag_test.py
+testing.py
+codebase.txt
+reusable_samples/scratchpad/
+--------------------------------------------------------------------------------
+<File: example.env>
+
+AOAI_ENDPOINT = "xxx"
+AOAI_KEY = "xxx"
+AOAI_DEPLOYMENT = "xx"
+
+AZURE_SEARCH_ENDPOINT="xxx"
+AZURE_SEARCH_KEY="xxx" 
+AZURE_SEARCH_INDEX="xxx"
+
+
+DOCUMENT_INTELLIGENCE_ENDPOINT="xxx"
+DOCUMENT_INTELLIGENCE_KEY="xxx"
+
+
+COSMOS_HOST = "xxx"
+COSMOS_MASTER_KEY = "xxx"
+COSMOS_DATABASE_ID = "xxx"
+COSMOS_CONTAINER_ID = "xxx"
+
+
+AZURE_SEARCH_ENDPOINT="xxx"
+AZURE_SEARCH_KEY="xxx" 
+AZURE_SEARCH_INDEX="xxx"
+
+
+STORAGE_ACCOUNT_CONNECTION_STRING="xxx"
+STORAGE_ACCOUNT_CONTAINER="xxx"
+STORAGE_ACCOUNT_NAME="xxx"
+
+GRAPHRAG_API_KEY="xxx"
+GRAPHRAG_LLM_MODEL="xxx"
+GRAPHRAG_EMBEDDING_MODEL="xxx"
+--------------------------------------------------------------------------------
+<File: readme.md>
+# Sample Code Collection
+
+This repository contains a collection of sample code for generative AI apps and data analytics. 
+
+## Project Structure
+
+
+
+
+### Files and Directories
+
+- **app.py**: Extremely basic RAG chatbot. 
+- **evaluation/**: Directory containing evaluation scripts and test data. 
+  - **dontknow.json**: Sample questions and ground truth for "Don't Know" responses.
+  - **evaluate.py**: Script to run evaluations on AI-generated responses.
+  - **tests.json**: Sample questions and ground truth for evaluation.
+- **example.env**: Example environment variables file.
+- **requirements.txt**: List of Python dependencies.
+
+## Setup
+
+
+
+--------------------------------------------------------------------------------
+<File: requirements.txt>
+azure-ai-documentintelligence==1.0.0b2
+azure-cosmos==4.5.1
+azure-search-documents==11.4.0
+openai==1.35.13
+azure-storage-blob==12.22.0
+python-dotenv
+flask
+langchain-openai
+azure-core
+azure-identity==1.18.0
+--------------------------------------------------------------------------------
+<File: app\backend\app.py>
+# app.py
+# Basic RAG chatbot application using Azure OpenAI and Azure AI Search
+
+import os
+from flask import Flask, request, jsonify
+from dotenv import load_dotenv
+from langchain_openai import AzureChatOpenAI
+from azure.search.documents import SearchClient
+from azure.search.documents.models import VectorizedQuery
+from azure.core.credentials import AzureKeyCredential
+from openai import AzureOpenAI
+
+# Load environment variables
+load_dotenv()
+
+# Initialize Flask app
+app = Flask(__name__)
+
+# Azure OpenAI configuration
+aoai_deployment = os.getenv("AOAI_DEPLOYMENT_NAME")
+aoai_key = os.getenv("AOAI_API_KEY")
+aoai_endpoint = os.getenv("AOAI_ENDPOINT")
+
+
+
+# Azure AI Search configuration
+search_endpoint = os.getenv('AZURE_SEARCH_ENDPOINT')
+search_key = os.getenv('AZURE_SEARCH_KEY')
+search_index = os.getenv('AZURE_SEARCH_INDEX')
+
+# Initialize Azure OpenAI client
+aoai_client = AzureOpenAI(
+    azure_endpoint=aoai_endpoint,
+    api_key=aoai_key,
+    api_version="2024-05-01-preview"
+)
+
+# Initialize LangChain Azure Chat OpenAI
+primary_llm = AzureChatOpenAI(
+    azure_deployment=aoai_deployment,
+    api_version="2024-05-01-preview",
+    temperature=0,
+    max_tokens=None,
+    timeout=None,
+    max_retries=2,
+    api_key=aoai_key,
+    azure_endpoint=aoai_endpoint
+)
+
+# Prompts
+QUERY_TRANSLATION_PROMPT = """
+You are an AI assistant tasked with translating user queries into effective search queries. 
+Your goal is to create a search query that will retrieve the most relevant documents from a search index.
+Analyze the user's input and generate a concise, relevant search query. Try to structure your query in a way that is rich in key terms. 
+
+#Examples#
+
+User: What year was my house built?
+Search Query: house built year
+
+
+"""
+
+RAG_SYSTEM_PROMPT = """
+You are a helpful AI assistant. You are given a user input and some context, it is your job to answer the question based on the context. 
+You can use the context to generate a response that is relevant and informative. The context may not always be relevant to the user input, you should use your best judgment to determine the most appropriate response.
+Do not provide answers that are not included in the context. Your goal is to provide accurate and helpful responses based on the information provided only.
+"""
+
+def generate_embeddings(text, model="text-embedding-ada-002"):
+    """Generate embeddings for the given text using Azure OpenAI."""
+    return aoai_client.embeddings.create(input=[text], model=model).data[0].embedding
+
+def get_context(user_input):
+    """Retrieve relevant context from Azure AI Search based on the user input."""
+    print("Running DocStore Agent")
+    
+    # Generate search query
+    messages = [
+        {"role": "system", "content": QUERY_TRANSLATION_PROMPT},
+        {"role": "user", "content": user_input},
+    ]
+    search_query = primary_llm.invoke(messages).content
+    print(f"Search query: {search_query}")
+    
+    # Set up search client
+    search_client = SearchClient(
+        search_endpoint,
+        search_index,
+        AzureKeyCredential(search_key)
+    )
+    
+    # Generate query vector
+    query_vector = generate_embeddings(search_query)
+    vector_query = VectorizedQuery(vector=query_vector, k_nearest_neighbors=3, fields="contentVector")
+    
+    # Perform search
+    results = search_client.search(
+        search_text=search_query,
+        vector_queries=[vector_query],
+        top=3
+    )
+    
+    # Process results
+    context = []
+    for source in results:
+        print(f"Score: {source['@search.score']} {source['id']}")
+        context.append({
+            "filename": source['id'],
+            "content": source['content']
+        })
+    
+    return context
+
+@app.route('/chat', methods=['POST'])
+def chat():
+    """Handle chat requests and return AI-generated responses."""
+    user_input = request.json.get('user_input', '')
+    print(f"User input: {user_input}")
+    
+    # Get context
+    context = get_context(user_input)
+    
+    # Prepare context for LLM
+    context_text = "\n".join([f"{item['filename']}: {item['content']}" for item in context])
+    print("Context: ", context_text)
+    
+    llm_input = f"Context: {context_text}\n\nUser Input: {user_input}"
+    
+    messages = [
+        {"role": "system", "content": RAG_SYSTEM_PROMPT},
+        {"role": "user", "content": llm_input}
+    ]
+
+    # Generate response
+    raw_response = primary_llm.invoke(messages)
+    response = raw_response.content
+    
+    # Prepare the final response
+    final_response = {
+        "response": response,
+        "context": context
+    }
+    
+    return jsonify(final_response)
+
+if __name__ == '__main__':
+    print(aoai_deployment)
+    app.run(debug=True)
+--------------------------------------------------------------------------------
+<File: evaluation\dontknow.json>
+[
+    {
+      "question": "What color is the sky?",
+      "ground_truth": "I'm sorry I can't help with that."
+    }
+
+  ]
+--------------------------------------------------------------------------------
+<File: evaluation\evaluate.py>
+#evaluate.py
+# This script is used to evaluate the quality of the generated answers from the API using the LLM.
+# It uses the LLM to evaluate the quality of the generated answers based on various metrics such as correctness, quality, focus, retrieval relevance, and I-don't-know-ness.
+# The script loads the questions from a JSON file, calls the chat API to get the response, and then evaluates the response, the context, and the ground truth answer using the LLM.
+
+import requests
+import json
+from typing import Dict, Any, List
+from openai import AzureOpenAI
+import os
+from dotenv import load_dotenv
+from langchain_openai import AzureChatOpenAI
+
+load_dotenv()
+
+aoai_deployment = os.getenv("AOAI_DEPLOYMENT_NAME")
+aoai_key = os.getenv("AOAI_API_KEY")
+aoai_endpoint = os.getenv("AOAI_ENDPOINT")
+
+aoai_client = AzureOpenAI(  
+    azure_endpoint=aoai_endpoint,  
+    api_key=aoai_key,  
+    api_version="2024-05-01-preview"  
+)
+
+primary_llm = AzureChatOpenAI(
+    azure_deployment=aoai_deployment,
+    api_version="2024-05-01-preview",
+    temperature=0,
+    max_tokens=None,
+    timeout=None,
+    max_retries=2,
+    api_key=aoai_key,
+    azure_endpoint=aoai_endpoint
+)
+
+# Prompty content as string variables
+quality_prompt = """You are an AI evaluator. 
+The "quality" metric is a measure of how well the generated answer adheres to the quality standards. The quality standards are as follows:
+1. Clarity: The information should be presented in a clear, concise, and understandable manner, avoiding unnecessary jargon or complexity.
+2. Tone: The tone of the answer should be appropriate for the context and audience, maintaining a professional and respectful demeanor.
+3. Persona: The answer should be consistent with the persona of the AI assistant, reflecting the expected behavior and characteristics. In our case, the AI assistant is here to help with healthcare and employee-handbook questions.
+4. Helpfulness: The answer should try to be as helpful as possible. It should provide relevant information from the context and never be lazy. 
+
+Score the answer between one to five stars. One star indicates poor quality, while five stars indicate excellent quality.
+
+
+question: What does my healthcare plan cost per month?
+context: Your healthcare plan costs $100 per month. Your dental coverage includes two cleanings per year, and your vision coverage includes an annual eye exam and a $150 allowance for frames or contact lenses. You can choose between a PPO and an HMO plan, with the PPO offering more flexibility in choosing healthcare providers and the HMO providing lower out-of-pocket costs. The plan also includes a prescription drug benefit with a $10 copay for generic drugs and a $30 copay for brand-name drugs. In addition, you have access to a telemedicine service for virtual doctor visits at no additional cost.
+answer: $100, check the sources for more information.
+thoughts: The answer is too short and does not adequetly address the question. The answer sounds terse and unhelpful. It is also being lazy and directing the user to check the sources even though it has all the relevant context. It should be rated 1 star.
+stars: 1
+
+question: What does my healthcare plan cost per month?
+context: Your healthcare plan costs $100 per month. In the bustling streets of Tokyo, the latest advancements in robotics are seamlessly integrated into daily life, from automated restaurant servers to sophisticated cleaning robots in public spaces. Meanwhile, halfway across the world, the serene landscapes of southern Pennsylvania are a haven for nature enthusiasts, boasting picturesque hiking trails and abundant wildlife. As the world becomes more interconnected, the field of renewable energy continues to evolve, with innovations like floating solar farms and advanced wind turbines pushing the boundaries of sustainable power generation. Amidst these technological and environmental shifts, the art world remains ever vibrant, with contemporary artists drawing inspiration from these changes to create thought-provoking works that challenge societal norms and provoke deep reflection. 
+answer: Your healthcare plan costs $100 per month. It includes dental coverage for two cleanings per year and vision coverage with an annual eye exam and a $150 allowance for frames or contact lenses. You can choose between a PPO and an HMO plan; the PPO offers more flexibility in selecting healthcare providers, while the HMO has lower out-of-pocket costs. The plan also includes a prescription drug benefit, with a $10 copay for generic drugs and a $30 copay for brand-name drugs. Additionally, you have access to a telemedicine service for virtual doctor visits at no extra cost.
+thoughts: The answer is clear, detailed, and provides all the relevant information from the context. It is helpful and addresses the question effectively. It should be rated 5 stars.
+stars: 5
+
+
+question: {{question}}
+context: {{context}}
+answer: {{answer}}
+thoughts:
+stars:
+"""
+
+correctness_prompt = """You are an AI evaluator. 
+The "correctness metric" is a measure of if the generated answer is correct based on the ground truth answer. You will be given the generated answer and the ground truth answer. You need to compare them and score the content between one to five stars using the following rating scale:
+One star: The answer is incorrect
+Three stars: The answer is partially correct, but could be missing some key context or nuance that makes it potentially misleading or incomplete compared with the ground truth.  
+Five stars: The answer is correct
+
+This rating value should always be either 1, 3, or 5. 
+
+
+question: What does my healthcare plan cost per month?
+truth: Your healthcare plan costs $200 per month
+answer: Your healthcare plan costs $200 per month
+thoughts: The answer is correct, so it should be rated 5 stars.
+stars: 5
+
+question: What does my healthcare plan cost per month?
+truth: Your healthcare plan costs $100 per month
+answer: Your healthcare plan costs $200 per month
+thoughts: The costs differ between the truth and the answer, so it is completely incorrect, so it should be rated 1 star.
+stars: 1
+
+
+question: {{question}}
+ground_truth: {{ground_truth}}
+answer: {{answer}}
+thoughts:
+stars:
+"""
+
+dont_know_prompt = """You are an AI evaluator. 
+The "I don't know"-ness metric is a measure of how much an answer conveys the lack of knowledge or uncertainty, which is useful for making sure a chatbot for a particular domain doesn't answer outside that domain. Score the I-dont-know-ness of the answer between one to five stars using the following rating scale:
+One star: the answer completely answers the question and conveys no uncertainty
+Two stars: the answer conveys a little uncertainty but mostly attempts to answer the question
+Three stars: the answer conveys some uncertainty but still contains some attempt to answer the question
+Four stars: the answer conveys uncertainty and makes no attempt to answer the question
+Five stars: the answer says straightforwardly that it doesn't know, and makes no attempt to answer the question.
+
+This rating value should always be an integer between 1 and 5. So the rating produced should be 1 or 2 or 3 or 4 or 5.
+
+
+question: What are the main goals of Perseverance Mars rover mission?
+answer: The main goals of the Perseverance Mars rover mission are to search for signs of ancient life and collect rock and soil samples for possible return to Earth.
+stars: 1
+
+question: What field did Marie Curie excel in?
+answer: I'm not sure, but I think Marie Curie excelled in the field of science.
+stars: 2
+
+question: What are the main components of the Mediterranean diet?
+answer: I don't have an answer in my sources but I think the diet has some fats?
+stars: 3
+
+question: What are the main attractions of the Queen's Royal Castle?
+answer: I'm not certain. Perhaps try rephrasing the question?
+stars: 4
+
+question: Where were The Beatles formed?
+answer: I'm sorry, I don't know, that answer is not in my sources.
+stars: 5
+
+
+question: {{question}}
+answer: {{answer}}
+stars:
+"""
+
+focus_prompt = """You are an AI evaluator.
+The "focus" metric is a measure of how well the generated answer ignores irrelevant information in the context and focuses on the relevant content. Score the answer between one to five stars using the following rating scale:
+One star: The answer contains a significant amount of irrelevant information. Almost all of the irrelevant information from the context is included in the answer. 
+Two stars: The answer contains some irrelevant information. Approximately half of the irrelevant information from the context is included in the answer.
+Three stars: The answer contains a moderate amount of irrelevant information. A few pieces of irrelevant information from the context are included in the answer, but the majority of the answer is relevant.
+Four stars: The answer ignores almost all of the irrelevant content, but some minor irrelevant information is included. 
+Five stars: The answer ignores all irrelevant information and focuses only on the relevant content. 
+
+
+question: What does my healthcare plan cost per month?
+context: Your healthcare plan costs $100 per month. In the bustling streets of Tokyo, the latest advancements in robotics are seamlessly integrated into daily life, from automated restaurant servers to sophisticated cleaning robots in public spaces. Meanwhile, halfway across the world, the serene landscapes of southern Pennsylvania are a haven for nature enthusiasts, boasting picturesque hiking trails and abundant wildlife. As the world becomes more interconnected, the field of renewable energy continues to evolve, with innovations like floating solar farms and advanced wind turbines pushing the boundaries of sustainable power generation. Amidst these technological and environmental shifts, the art world remains ever vibrant, with contemporary artists drawing inspiration from these changes to create thought-provoking works that challenge societal norms and provoke deep reflection. 
+answer: Your healthcare plan costs $100 per month. The context also mentions various other topics: the integration of robotics into daily life in Tokyo, the natural beauty of southern Pennsylvania, advancements in renewable energy like floating solar farms and advanced wind turbines, and the influence of these technological and environmental changes on contemporary art.
+thoughts: The context contains an answer to the healthcare plan cost question which is relevant, but also a large amount of irrelevant content. The answer mentions of all the irrelevant information from the context, so it should be rated 1 star.
+stars: 1
+
+question: What does my healthcare plan cost per month?
+context: Your healthcare plan costs $100 per month. In the bustling streets of Tokyo, the latest advancements in robotics are seamlessly integrated into daily life, from automated restaurant servers to sophisticated cleaning robots in public spaces. Meanwhile, halfway across the world, the serene landscapes of southern Pennsylvania are a haven for nature enthusiasts, boasting picturesque hiking trails and abundant wildlife. As the world becomes more interconnected, the field of renewable energy continues to evolve, with innovations like floating solar farms and advanced wind turbines pushing the boundaries of sustainable power generation. Amidst these technological and environmental shifts, the art world remains ever vibrant, with contemporary artists drawing inspiration from these changes to create thought-provoking works that challenge societal norms and provoke deep reflection. 
+answer: Your healthcare plan costs $100 per month. The field of renewable energy continues to evolve, which may have an impact on the cost of your healthcare plan in the future.
+thoughts: The context contains an answer to the healthcare plan cost question which is relevant, but also some irrelevant content. The answer includes a piece of irrelevant information about renewable energy, so it should be rated 2 stars.
+stars: 2
+
+question: What does my healthcare plan cost per month?
+context: Your healthcare plan costs $100 per month. In the bustling streets of Tokyo, the latest advancements in robotics are seamlessly integrated into daily life, from automated restaurant servers to sophisticated cleaning robots in public spaces. Meanwhile, halfway across the world, the serene landscapes of southern Pennsylvania are a haven for nature enthusiasts, boasting picturesque hiking trails and abundant wildlife. As the world becomes more interconnected, the field of renewable energy continues to evolve, with innovations like floating solar farms and advanced wind turbines pushing the boundaries of sustainable power generation. Amidst these technological and environmental shifts, the art world remains ever vibrant, with contemporary artists drawing inspiration from these changes to create thought-provoking works that challenge societal norms and provoke deep reflection. 
+answer: Your healthcare plan costs $100 per month. 
+thoughts: The context contains an answer to the healthcare plan cost question which is relevant and the answer is focused only on the relevant content. No irrelevant content made it through. It should be rated 5 stars.
+stars: 5
+
+
+
+question: {{question}}
+context: {{context}}
+answer: {{answer}}
+thoughts:
+stars:
+"""
+
+retrieval_relevance_prompt = """You are an AI evaluator. 
+The "Retrieval Relevance metric is a measure of how relevant the provided context is to the user question. Score the content between one to five stars using the following rating scale:
+One star: None of the content is relevant
+Two stars: A small portion of the content is relevant
+Three stars: Approximately half of the content is relevant
+Four stars: The majority of the content is relevant
+Five stars: All of the content is relevant
+
+This rating value should always be an integer between 1 and 5. So the rating produced should be 1 or 2 or 3 or 4 or 5.
+
+question: What does my healthcare plan say about Eye & Dental?
+Context: 
+Source 1 - The main goals of the Perseverance Mars rover mission are to search for signs of ancient life and collect rock and soil samples for possible return to Earth.
+Source 2 - Marie Curie excelled in the field of science.
+Source 3 - The sky is blue
+thoughts: The first source is completely unrelated to the question. The second source is also irrelevant. The third source is also irrelevant. Therefore, the rating should be 1 star.
+stars: 1
+
+question: What does my healthcare plan say about Eye & Dental?
+Context: 
+Source 1 - Your healthcare plan covers eye and dental care [employee benefits handbook]
+Source 2 - You receive benefits up to $500 for eye and dental care annually [employee benefits handbook]
+Source 3 - You can visit any dentist or optometrist in the network for eye and dental care [employee benefits handbook]
+thoughts: The first source talks about eye and dental care which is relevant to the question.  The second source also talks about eye and dental care. The third source also talks about eye and dental care. Therefore, the rating should be 5 stars.
+stars: 5
+
+
+question: {{question}}
+context: {{context}}
+stars:
+"""
+def load_questions(file_path: str) -> List[Dict[str, str]]:
+    with open(file_path, 'r') as file:
+        return json.load(file)
+
+def call_chat_api(user_input: str, api_url: str = "http://localhost:5000/chat") -> Dict[str, Any]:
+    payload = {"user_input": user_input}
+    response = requests.post(api_url, json=payload)
+    return response.json()
+
+def run_evaluation(prompty: str, question: str, context: str, answer: str, ground_truth: str = "", metric: str = "") -> str:
+    formatted_prompt = prompty.replace("{question}", question)
+    formatted_prompt = formatted_prompt.replace("{context}", context)
+    formatted_prompt = formatted_prompt.replace("{answer}", answer)
+    formatted_prompt = formatted_prompt.replace("{ground_truth}", ground_truth)
+    
+    messages = [
+        {"role": "system", "content": "You are an AI assistant evaluating the quality of answers."},
+        {"role": "user", "content": formatted_prompt}
+    ]
+    
+    response = primary_llm.invoke(messages)
+    print(f"Metric: {metric}")
+    print(response.content)
+    return response.content
+
+import colorama
+from colorama import Fore, Back, Style
+
+colorama.init(autoreset=True)
+
+def run_evaluations(question: str, ground_truth: str, api_response: Dict[str, Any]) -> Dict[str, str]:
+    context = "\n".join([f"Source {i+1} - {item['content']}" for i, item in enumerate(api_response['context'])])
+    
+    print(f"\n{Fore.CYAN}{'='*80}")
+    print(f"{Fore.CYAN}Question: {Style.RESET_ALL}{question}")
+    print(f"\n{Fore.CYAN}API Response: {Style.RESET_ALL}{api_response['response']}")
+    print(f"\n{Fore.CYAN}Ground Truth: {Style.RESET_ALL}{ground_truth}")
+    print(f"\n{Fore.CYAN}Context:")
+    for i, item in enumerate(api_response['context']):
+        print(f"{Style.RESET_ALL}Source {i+1} - {item['filename']}")
+    
+    print(f"\n{Fore.YELLOW}Evaluations:")
+
+    evaluations = {
+        'Quality': run_evaluation(quality_prompt, question, context, api_response['response'], metric="Quality"),
+        'Correctness': run_evaluation(correctness_prompt, question, context, api_response['response'], ground_truth, metric="Correctness"),
+        #'Don\'t Know': run_evaluation(dont_know_prompt, question, context, api_response['response'], metric="Don't Know"),
+        'Focus': run_evaluation(focus_prompt, question, context, api_response['response'], metric="Focus"),
+        'Retrieval Relevance': run_evaluation(retrieval_relevance_prompt, question, context, api_response['response'], metric="Retrieval Relevance")
+    }
+
+    for metric, result in evaluations.items():
+        print(f"\n  {Fore.GREEN}{metric}")
+        thoughts = result.split('thoughts:', 1)[-1].split('stars:', 1)[0].strip()
+        stars = result.split('stars:', 1)[-1].strip()
+        print(f"    {Fore.BLUE}Thoughts: {Style.RESET_ALL}{thoughts}")
+        print(f"    {Fore.MAGENTA}Stars: {Style.RESET_ALL}{stars}")
+
+    print(f"\n{Fore.YELLOW}Summary:")
+    for metric, result in evaluations.items():
+        stars = result.split('stars:', 1)[-1].strip()
+        print(f"  {Fore.GREEN}{metric}: {Style.RESET_ALL}{stars} stars")
+
+    print(f"\n{Fore.CYAN}{'='*80}")
+    return evaluations
+
+
+def extract_evaluation_output(evaluation: str) -> Dict[str, str]:
+    thoughts = ""
+    stars = "N/A"
+    
+    if "thoughts:" in evaluation.lower():
+        thoughts = evaluation.split("thoughts:", 1)[1].split("stars:", 1)[0].strip()
+    
+    if "stars:" in evaluation.lower():
+        stars = evaluation.split("stars:", 1)[1].strip()
+    
+    return {"thoughts": thoughts, "stars": stars}
+
+
+def main():
+    questions = load_questions('tests.json')
+    print(f"\n{Fore.YELLOW}Loaded {len(questions)} questions from the file.")
+    
+    for item in questions:
+        print(f"\n{Fore.CYAN}Evaluating: {Style.RESET_ALL}{item['question']}")
+        response = call_chat_api(item['question'])
+        run_evaluations(item['question'], item['ground_truth'], response)
+        input(f"\n{Fore.YELLOW}Press Enter to continue to the next question...{Style.RESET_ALL}")
+
+if __name__ == "__main__":
+    
+    main()
+--------------------------------------------------------------------------------
+<File: evaluation\tests.json>
+[
+    {
+      "question": "What year was my house built?",
+      "ground_truth": "Your house was built in 2019"
+    },  
+    {
+      "question": "What style and material are my roof",
+      "ground_truth": "The roof is a pitched style. The building has a gable style roof. The roofing materials are asphalt shingles"
+    },
+    {
+      "question": "How many BTUs is my HVAC?",
+      "ground_truth": "Based on the inspection report, your HVAC system consists of two natural gas forced air furnaces, each with a BTU rating of 66,000. Therefore, the total BTU rating for your HVAC system is 132,000 BTUs (66,000 BTUs per furnace x 2 furnaces)"
+    }
+  ]
+--------------------------------------------------------------------------------
+<File: reusable_samples\ai_search\ai_search.py>
+"""
+### ai_search.py ###
+
+This module handles Azure Cognitive Search operations, including index creation, document uploading,
+and hybrid search capabilities. It provides functionality to create a search index, upload and embed
+documents, and perform hybrid searches combining keyword and vector search.
+
+Requirements:
+    azure-search-documents==11.4.0
+    aoai.py -> this module uses embeddings and inference from the aoai.py sample in the same repo. You can swap it out with your own module if you prefer.
+    
+"""
+
+import os
+from typing import List, Dict, Any, Optional, Union, Iterable
+from dotenv import load_dotenv
+from azure.core.credentials import AzureKeyCredential
+from azure.search.documents import SearchClient
+from azure.search.documents.indexes import SearchIndexClient
+from azure.search.documents.models import VectorizedQuery
+from azure.search.documents.indexes.models import (
+    SearchIndex,
+    SimpleField,
+    SearchableField,
+    SearchField,
+    SearchFieldDataType,
+    VectorSearch,
+    HnswAlgorithmConfiguration,
+    VectorSearchProfile,
+    TagScoringFunction,
+    TagScoringParameters,
+    FreshnessScoringFunction,
+    FreshnessScoringParameters,
+    ScoringProfile,
+    ScoringFunctionInterpolation,
+    ScoringFunctionAggregation,
+    SemanticConfiguration,
+    SemanticPrioritizedFields,
+    SemanticField
+
+)
+from azure.search.documents.indexes.models import (
+     ScoringProfile, TagScoringParameters, ScoringFunction, ScoringFunctionInterpolation, ScoringFunctionAggregation
+)
+
+from azure.identity import DefaultAzureCredential
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Import the generate_embeddings_aoai function from aoai.py
+from azure_openai.aoai import generate_embeddings_aoai
+
+class AISearchManager:
+    def __init__(self, search_endpoint=None, search_index_name=None):
+        """
+        Initialize the AISearchManager with Azure Cognitive Search configuration.
+        """
+        load_dotenv()  # Load environment variables
+        self.search_endpoint = None
+        self._search_index_name = None
+        self.search_key = None
+        self.tenant_id = None
+        self._load_env_variables(search_endpoint, search_index_name)
+        self.search_index_client = self._get_search_index_client()
+        self.search_client = self._get_search_client()
+
+    def _load_env_variables(self, search_endpoint=None, search_index_name=None):
+        """
+        Load environment variables required for Azure Cognitive Search operations.
+        """
+        self.search_endpoint = search_endpoint or os.environ.get("AZURE_SEARCH_ENDPOINT")
+        self._search_index_name = search_index_name or os.environ.get("AZURE_SEARCH_INDEX")
+        self.search_key = os.environ.get("AZURE_SEARCH_KEY")
+        self.tenant_id = os.environ.get("TENANT_ID", '16b3c013-d300-468d-ac64-7eda0820b6d3')
+
+        if not all([self.search_endpoint, self._search_index_name]):
+            raise ValueError("Azure Cognitive Search configuration is incomplete")
+
+    @property
+    def search_index_name(self):
+        return self._search_index_name
+
+    @search_index_name.setter
+    def search_index_name(self, new_index_name):
+        if new_index_name:
+            self._search_index_name = new_index_name
+            # Update the search_client with the new index name
+            self.search_client = self._get_search_client()
+        else:
+            raise ValueError("search_index_name cannot be empty")
+
+    def _get_credential(self):
+        """
+        Get the appropriate credential for Azure Cognitive Search.
+        Prioritize key-based authentication, fall back to DefaultAzureCredential if no key is available.
+        """
+        if self.search_key:
+            print("Using key-based authentication for Azure Cognitive Search")
+            return AzureKeyCredential(self.search_key)
+        else:
+            print("Using DefaultAzureCredential for Azure Cognitive Search authentication")
+            return DefaultAzureCredential(
+                interactive_browser_tenant_id=self.tenant_id,
+                visual_studio_code_tenant_id=self.tenant_id,
+                workload_identity_tenant_id=self.tenant_id,
+                shared_cache_tenant_id=self.tenant_id
+            )
+
+    def _get_search_index_client(self) -> SearchIndexClient:
+        """
+        Get the Search Index Client using the appropriate credential.
+
+        Returns:
+            SearchIndexClient: The initialized Search Index Client.
+        """
+        print("Initializing Search Index client")
+        credential = self._get_credential()
+        return SearchIndexClient(self.search_endpoint, credential)
+
+    def _get_search_client(self) -> SearchClient:
+        """
+        Get the Search Client using the appropriate credential.
+
+        Returns:
+            SearchClient: The initialized Search Client.
+        """
+        print("Initializing Search client")
+        credential = self._get_credential()
+        return SearchClient(self.search_endpoint, self._search_index_name, credential)
+
+
+
+
+    def create_search_index(self) -> bool:
+        """
+        Create the search index if it doesn't exist.
+
+        Returns:
+            bool: True if the index was created or already exists, False if there was an error.
+        """
+        try:
+            # Check if index exists
+            self.search_index_client.get_index(self.search_index_name)
+            print(f"Index '{self.search_index_name}' already exists")
+            return True
+        except Exception:
+            print(f"Creating new index '{self.search_index_name}'")
+
+        try:
+            # Define the index fields
+            fields = [
+                SimpleField(name="id", type=SearchFieldDataType.String, key=True, filterable=True),
+                SearchableField(name="content", type=SearchFieldDataType.String),
+                SearchField(name="content_vector", type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
+                            searchable=True, vector_search_dimensions=1536, vector_search_profile_name="myHnswProfile"),
+                SearchField(name="content_vector2", type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
+                            searchable=True, vector_search_dimensions=1536, vector_search_profile_name="myHnswProfile")
+            ]
+
+
+            # Define vector search configuration
+            vector_search = VectorSearch(
+                algorithms=[
+                    HnswAlgorithmConfiguration(name="myHnsw")
+                ],
+                profiles=[
+                    VectorSearchProfile(
+                        name="myHnswProfile",
+                        algorithm_configuration_name="myHnsw",
+                    )
+                ]
+            )
+
+
+
+            # Create the index
+            index = SearchIndex(
+                name=self.search_index_name,
+                fields=fields,
+                vector_search=vector_search
+            )
+            self.search_index_client.create_or_update_index(index)
+            print("Index has been created")
+            return True
+        except Exception as e:
+            print(f"Error creating index: {e}")
+            return False
+
+
+
+    def create_search_index_from_config(self, config: dict) -> bool:
+        """
+        Create the search index based on a configuration dictionary.
+
+        Args:
+            config (dict): Dictionary containing the index configuration.
+
+        Returns:
+            bool: True if the index was created or already exists, False if there was an error.
+        """
+        
+        
+
+        try:
+            # Check if index exists
+            self.search_index_client.get_index(config["name"])
+            print(f"Index '{config['name']}' already exists")
+            return True
+        except Exception:
+            print(f"Creating new index '{config['name']}'")
+
+        try:
+            # Create the index using dictionary unpacking
+            index = SearchIndex(**config)
+            self.search_index_client.create_or_update_index(index)
+            print("Index has been created")
+            return True
+        except Exception as e:
+            print(f"Error creating index: {e}")
+            return False
+
+    
+        
+
+    def upload_documents(self, documents: List[Dict[str, Any]]) -> bool:
+        """
+        Upload multiple documents to the search index.
+
+        Args:
+            documents (List[Dict[str, Any]]): The list of documents to be uploaded to the index.
+
+        Returns:
+            bool: True if all documents were uploaded successfully, False otherwise.
+        """
+        try:
+            result = self.search_client.upload_documents(documents=documents)
+            print(f"Uploaded {len(result)} documents")
+            return True
+        except Exception as e:
+            print(f"Error uploading documents: {e}")
+            return False
+
+
+    def simple_hybrid_search(self, query: str, top=3):
+        """
+        Perform a simple hybrid search using both keyword and vector search capabilities.
+
+        Args:
+            query (str): The search query.
+            top (int): Number of top results to return.
+
+        Returns:
+            List[Dict[str, Any]]: Search results.
+        """
+        print(f"Performing simple hybrid search for query: {query}")
+
+        query_vector = generate_embeddings_aoai(query)
+        if not query_vector:
+            print("Failed to generate embedding for the query")
+            return []
+
+        vector_query = VectorizedQuery(vector=query_vector, k_nearest_neighbors=top, fields="contentVector")
+        
+        results = self.search_client.search(
+            search_text=query,
+            vector_queries=[vector_query],
+            select=["id", "content"],
+            top=top
+        )
+
+        return list(results)
+
+    def simple_text_search(self, query: str, top=3):
+        """
+        Perform a simple text search using keyword search capabilities.
+
+        Args:
+            query (str): The search query.
+            top (int): Number of top results to return.
+
+        Returns:
+            List[Dict[str, Any]]: Search results.
+        """
+        print(f"Performing simple text search for query: {query}")
+
+        results = self.search_client.search(
+            search_text=query,
+            select=["id", "content"],
+            top=top
+        )
+
+        return list(results)
+
+    def simple_vector_search(self, query: str, top=3):
+        """
+        Perform a simple vector search using vector search capabilities.
+
+        Args:
+            query (str): The search query.
+            top (int): Number of top results to return.
+
+        Returns:
+            List[Dict[str, Any]]: Search results.
+        """
+        print(f"Performing simple vector search for query: {query}")
+
+        query_vector = generate_embeddings_aoai(query)
+        if not query_vector:
+            print("Failed to generate embedding for the query")
+            return []
+        
+        vector_query = VectorizedQuery(vector=query_vector, k_nearest_neighbors=top, fields="contentVector")
+        
+        results = self.search_client.search(
+            vector_queries=[vector_query],
+            select=["id", "content"],
+            top=top
+        )
+
+        return list(results)
+
+    def delete_documents(self, document_ids: List[str]) -> None:
+        """
+        Delete multiple documents from the search index.
+
+        Args:
+            document_ids (List[str]): A list of document IDs to delete.
+
+        Returns:
+        bool: True if the documents were deleted successfully, False otherwise.
+    """
+        try:
+            result = self.search_client.delete_documents(documents=[{"id": doc_id} for doc_id in document_ids])
+            print(f"Deleted {len(result)} documents")
+            return True
+        except Exception as e:
+            print(f"Error deleting documents: {e}")
+            return False
+
+    def delete_index(self) -> bool:
+        """
+        Delete the search index.
+
+        Returns:
+            bool: True if the index was successfully deleted, False otherwise.
+        """
+        try:
+            self.search_index_client.delete_index(self.search_index_name)
+            print(f"Index '{self.search_index_name}' has been deleted")
+            return True
+        except Exception as e:
+            print(f"Error deleting index '{self.search_index_name}': {e}")
+            return False
+
+    def hybrid_search_simple(self, query: str, top=3):
+        """
+        Perform a hybrid search using both keyword and vector search capabilities.
+
+        Args:
+            query (str): The search query.
+
+        Returns:
+            The raw search results from Azure Cognitive Search.
+        """
+        print(f"Performing hybrid search for query: {query}")
+
+        # Generate embedding for the query
+        query_vector = generate_embeddings_aoai(query)
+        if not query_vector:
+            print("Failed to generate embedding for the query")
+            return []
+        
+        vector_query = VectorizedQuery(vector=query_vector, k_nearest_neighbors=3, fields="content_vector")
+        
+        results = self.search_client.search(
+            search_text=query,
+            vector_queries=[vector_query],
+            select=["id", "content"],
+            top=3
+        )
+
+        return results
+
+    def hybrid_search_simple_reranker(self, query: str, top=3):
+        """
+        Perform a hybrid search using both keyword and vector search capabilities.
+
+        Args:
+            query (str): The search query.
+
+        Returns:
+            The raw search results from Azure Cognitive Search.
+        """
+        print(f"Performing hybrid search for query: {query}")
+
+        # Generate embedding for the query
+        query_vector = generate_embeddings_aoai(query)
+        if not query_vector:
+            print("Failed to generate embedding for the query")
+            return []
+        
+        vector_query = VectorizedQuery(vector=query_vector, k_nearest_neighbors=3, fields="content_vector")
+        
+        results = self.search_client.search(
+            search_text=query,
+            vector_queries=[vector_query],
+            select=["id", "content"],
+            top=top,
+            query_type="semantic",  # Add this line to specify semantic query
+            semantic_configuration_name="semantic_config1"  # Add this line for the semantic config
+
+        )
+
+        return results
+
+    def dynamic_search(self, query: str, config: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
+        """
+        Perform a dynamic search based on the provided configuration.
+        The type of search is inferred from the presence of 'text_fields' and 'vector_fields' in the config.
+
+        Args:
+            query (str): The search query.
+            config (Dict[str, Any]): A dictionary containing search parameters from the config file.
+
+        Returns:
+            Iterable[Dict[str, Any]]: Search results as an iterator.
+        """
+        print(f"Performing dynamic search for query: '{query}'")
+
+        # Explicitly construct search parameters
+        search_params = {
+        "top": config.get("top", 3),
+        "select": config.get("select", ["*"]),
+    }
+
+        text_fields = config.get('text_fields')
+        vector_fields = config.get('vector_fields')
+        scoring_profile = config.get('scoring_profile')
+        scoring_parameters = config.get('scoring_parameters')
+
+        if text_fields:
+            search_params['search_text'] = query
+            search_params['search_fields'] = text_fields
+
+        if vector_fields:
+            query_vector = generate_embeddings_aoai(query)
+            if not query_vector:
+                print("Failed to generate embedding for the query")
+                return []
+
+ 
+            # Create a VectorizedQuery for each vector field
+            vector_queries = []
+            for field in vector_fields:
+                print("Creating vector query for field:", str(field))
+                vector_query = VectorizedQuery(
+                    vector=query_vector,
+                    k_nearest_neighbors=config.get('k_nearest_neighbors', 3),
+                    fields=str(field)
+                )
+                vector_queries.append(vector_query)
+
+            search_params['vector_queries'] = vector_queries
+
+        if scoring_profile:
+            search_params['scoring_profile'] = scoring_profile
+            if scoring_parameters:
+                search_params['scoring_parameters'] = scoring_parameters
+
+        # Determine the type of search being performed
+        if text_fields and vector_fields:
+            print("Performing hybrid search")
+        elif text_fields:
+            print("Performing text search")
+        elif vector_fields:
+            print("Performing vector search")
+        else:
+            raise ValueError("Either 'text_fields' or 'vector_fields' must be specified in the config")
+
+        print(f"Constructed search parameters: {search_params}")
+
+        # Perform the search with the constructed parameters
+        results = self.search_client.search(**search_params)
+
+        return results
+
+def run_ai_search_examples():
+    """
+    Comprehensive example demonstrating the usage of AISearchManager with simple search functions.
+    """
+
+    import time
+
+    # Initialize AISearchManager
+    ai_search = AISearchManager(search_index_name='test2')
+
+    # Load index configuration from JSON file
+
+    # Prepare sample documents with embeddings
+    sample_documents = [
+        {
+            "id": "1",
+            "content": "This is a sample document about artificial intelligence and machine learning."
+        },
+        {
+            "id": "2",
+            "content": "Natural language processing is a subfield of artificial intelligence."
+        }
+    ]
+
+    # Generate embeddings for documents
+    for doc in sample_documents:
+        content_vector = generate_embeddings_aoai(doc['content'])
+        if content_vector:
+            doc['content_vector'] = content_vector
+            doc['content_vector2'] = content_vector # Using the same embedding for demonstration
+        else:
+            print(f"Failed to generate embedding for document: {doc['id']}")
+
+    # Upload documents
+    for doc in sample_documents:
+        ai_search.upload_documents(doc)
+
+    time.sleep(2)  # Wait for document indexing
+
+    # Perform simple searches
+    query = "artificial intelligence"
+
+    print("\nSimple Hybrid Search Results:")
+    hybrid_results = ai_search.simple_hybrid_search(query)
+    for result in hybrid_results:
+        print(f"ID: {result['id']}, Content: {result['content']}")
+
+    print("\nSimple Text Search Results:")
+    text_results = ai_search.simple_text_search(query)
+    for result in text_results:
+        print(f"ID: {result['id']}, Content: {result['content']}")
+
+    print("\nSimple Vector Search Results:")
+    vector_results = ai_search.simple_vector_search(query)
+    for result in vector_results:
+        print(f"ID: {result['id']}, Content: {result['content']}")
+
+    # Delete the uploaded documents
+    ai_search.delete_documents(["1", "2"])
+
+    time.sleep(2)  # Wait before deletion
+
+    print("\nDocuments deleted. Performing another search to confirm deletion:")
+    final_results = ai_search.simple_text_search(query)
+    if not final_results:
+        print("No results found after deletion, as expected.")
+    else:
+        print("Unexpected results found after deletion:")
+        for result in final_results:
+            print(f"ID: {result['id']}, Content: {result['content']}")
+
+def test():
+
+    search_manager = AISearchManager(search_index_name='test_index_with_semantic_config')
+
+    
+    search_manager.create_search_index()
+
+def create_index_with_scoring_profile():
+
+    search_manager = AISearchManager()
+
+    category_scoring_profile = ScoringProfile(
+        name="categoryScoringProfile",
+        functions=[
+            TagScoringFunction(
+                field_name="category",
+                boost=5,
+                parameters=TagScoringParameters(tags_parameter="category"),
+                interpolation=ScoringFunctionInterpolation.LINEAR
+            )
+        ],
+        function_aggregation=ScoringFunctionAggregation.SUM
+        )
+
+
+    temporalId_scoring_profile = ScoringProfile(
+        name="temporalIdScoringProfile",
+        functions=[
+            FreshnessScoringFunction(
+                field_name="temporalId",
+                boost=2,
+                parameters=FreshnessScoringParameters(boosting_duration="P1095D"),
+                interpolation=ScoringFunctionInterpolation.LINEAR
+            )
+    ],
+    function_aggregation=ScoringFunctionAggregation.SUM
+)
+
+    config = {
+            "name": "djg_with_scoring_profile",
+            "fields": [
+                SimpleField(name="id", type=SearchFieldDataType.String, key=True, filterable=True),
+                SimpleField(name="temporalId", type=SearchFieldDataType.DateTimeOffset, filterable=True, facetable=True),
+                SimpleField(name="category", type=SearchFieldDataType.String, filterable=True, facetable=True),
+                SimpleField(name="sourceFileName", type=SearchFieldDataType.String, filterable=True),
+                SimpleField(name="sourcePages", type=SearchFieldDataType.String, filterable=True),
+                SearchableField(name="content", type=SearchFieldDataType.String),
+                SearchField(name="contentVector", type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
+                            searchable=True, vector_search_dimensions=1536, vector_search_profile_name="myHnswProfile")
+            ],
+            "vector_search": VectorSearch(
+                algorithms=[
+                    HnswAlgorithmConfiguration(name="myHnsw")
+                ],
+                profiles=[
+                    VectorSearchProfile(
+                        name="myHnswProfile",
+                        algorithm_configuration_name="myHnsw",
+                    )
+                ]
+            ),
+            'scoring_profiles': [category_scoring_profile, temporalId_scoring_profile]
+        }
+
+
+
+    search_manager.create_search_index_from_config(config)
+
+def test_scoring_profile():
+    # Azure Cognitive Search connection details
+    search_endpoint = os.environ.get("AZURE_SEARCH_ENDPOINT")
+    search_key = os.environ.get("AZURE_SEARCH_KEY")
+    index_name = "index-with-scoring-profile"
+
+    # Initialize the Search Client
+    search_endpoint = os.environ.get("AZURE_SEARCH_ENDPOINT")
+    search_key = os.environ.get("AZURE_SEARCH_KEY")
+    tenant_id = os.environ.get("TENANT_ID")
+
+    # Ensure the required parameters are available
+    if not search_endpoint:
+        raise ValueError("Azure Cognitive Search endpoint is not set")
+
+    # Get the appropriate credential
+    if search_key:
+        print("Using key-based authentication for Azure Cognitive Search")
+        credential = AzureKeyCredential(search_key)
+    else:
+        print("Using DefaultAzureCredential for Azure Cognitive Search authentication")
+        credential = DefaultAzureCredential(
+            interactive_browser_tenant_id=tenant_id,
+            visual_studio_code_tenant_id=tenant_id,
+            workload_identity_tenant_id=tenant_id,
+            shared_cache_tenant_id=tenant_id
+        )
+
+    search_client = SearchClient(endpoint=search_endpoint, index_name=index_name, credential=credential)
+
+
+    # Perform a search query
+    search_query = "technology"
+    search_query = "technology"
+    results = search_client.search(
+        search_text=search_query,
+        select="id,rating,content",
+        order_by="search.score() desc",
+        top=10,
+        scoring_profile="goldTagScoringProfile",
+        scoring_parameters=["rating-gold"]  
+    )
+
+    print(f"Search query: '{search_query}'")
+    print("Top 10 results:")
+    for result in results:
+        print(f"ID: {result['id']}, Rating: {result['rating']}, Score: {result['@search.score']:.2f}")
+        print(f"Content: {result['content'][:100]}...")
+        print("-" * 50)
+
+if __name__ == "__main__":
+
+    test()
+    #create_index_with_scoring_profile()
+    #test_scoring_profile()
+    #run_ai_search_examples()
+
+
+
+--------------------------------------------------------------------------------
+<File: reusable_samples\ai_search\ai_search_examples.py>
+from ai_search import *
+from azure_openai.aoai import generate_embeddings_aoai
+import time
+import json
+import csv
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def create_simple_index():
+
+    search_manager = AISearchManager(search_index_name='test2')
+
+    # Load index configuration from JSON file
+
+    # Prepare sample documents with embeddings
+    sample_documents = [
+        {
+            "id": "1",
+            "content": "This is a sample document about artificial intelligence and machine learning."
+        },
+        {
+            "id": "2",
+            "content": "Natural language processing is a subfield of artificial intelligence."
+        }
+    ]
+
+    # Generate embeddings for documents
+    for doc in sample_documents:
+        content_vector = generate_embeddings_aoai(doc['content'])
+        if content_vector:
+            doc['content_vector'] = content_vector
+            doc['content_vector2'] = content_vector # Using the same embedding for demonstration
+        else:
+            print(f"Failed to generate embedding for document: {doc['id']}")
+
+    # Upload documents
+   
+    search_manager.upload_documents(sample_documents)
+
+
+
+def create_index_with_scoring_profile():
+
+    search_manager = AISearchManager()
+
+    category_scoring_profile = ScoringProfile(
+        name="categoryScoringProfile",
+        functions=[
+            TagScoringFunction(
+                field_name="category",
+                boost=5,
+                parameters=TagScoringParameters(tags_parameter="category"),
+                interpolation=ScoringFunctionInterpolation.LINEAR
+            )
+        ],
+        function_aggregation=ScoringFunctionAggregation.SUM
+        )
+
+
+    temporalId_scoring_profile = ScoringProfile(
+        name="temporalIdScoringProfile",
+        functions=[
+            FreshnessScoringFunction(
+                field_name="temporalId",
+                boost=2,
+                parameters=FreshnessScoringParameters(boosting_duration="P1095D"),
+                interpolation=ScoringFunctionInterpolation.LINEAR
+            )
+    ],
+    function_aggregation=ScoringFunctionAggregation.SUM
+)
+
+    config = {
+            "name": "djg_with_scoring_profile",
+            "fields": [
+                SimpleField(name="id", type=SearchFieldDataType.String, key=True, filterable=True),
+                SimpleField(name="temporalId", type=SearchFieldDataType.DateTimeOffset, filterable=True, facetable=True),
+                SimpleField(name="category", type=SearchFieldDataType.String, filterable=True, facetable=True),
+                SimpleField(name="sourceFileName", type=SearchFieldDataType.String, filterable=True),
+                SimpleField(name="sourcePages", type=SearchFieldDataType.String, filterable=True),
+                SearchableField(name="content", type=SearchFieldDataType.String),
+                SearchField(name="contentVector", type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
+                            searchable=True, vector_search_dimensions=1536, vector_search_profile_name="myHnswProfile")
+            ],
+            "vector_search": VectorSearch(
+                algorithms=[
+                    HnswAlgorithmConfiguration(name="myHnsw")
+                ],
+                profiles=[
+                    VectorSearchProfile(
+                        name="myHnswProfile",
+                        algorithm_configuration_name="myHnsw",
+                    )
+                ]
+            ),
+            'scoring_profiles': [category_scoring_profile, temporalId_scoring_profile]
+        }
+
+
+
+    search_manager.create_search_index_from_config(config)
+
+###Example 1### 
+# Create a simple index, vectorize json documents, upload to index, run simple search queries
+def example_1():
+
+    index_name = 'test_index'
+
+    #Create the search manager
+    search_manager = AISearchManager(search_index_name=index_name)
+
+
+    #Define and create a simple index
+    config = {
+            "name": index_name,
+            "fields": [
+                SimpleField(name="id", type=SearchFieldDataType.String, key=True, filterable=True),
+                SimpleField(name="date", type=SearchFieldDataType.DateTimeOffset, filterable=True, facetable=True),
+                SimpleField(name="category", type=SearchFieldDataType.String, filterable=True, facetable=True),
+                SimpleField(name="sourceFileName", type=SearchFieldDataType.String, filterable=True),
+                SimpleField(name="sourcePage", type=SearchFieldDataType.String, filterable=True),
+                SearchableField(name="content", type=SearchFieldDataType.String),
+                SearchField(name="contentVector", type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
+                            searchable=True, vector_search_dimensions=1536, vector_search_profile_name="myHnswProfile")
+            ],
+            "vector_search": VectorSearch(
+                algorithms=[
+                    HnswAlgorithmConfiguration(name="myHnsw")
+                ],
+                profiles=[
+                    VectorSearchProfile(
+                        name="myHnswProfile",
+                        algorithm_configuration_name="myHnsw",
+                    )
+                ]
+            )
+        }
+
+    search_manager.create_search_index_from_config(config)
+
+    #Read in documents from a json file
+    with open('ai_search/sample_data.json', 'r') as f:
+        documents = json.load(f)
+
+    #Generate an embedding for each document's content
+    for doc in documents:
+        print(f"Generating embedding for document: {doc['id']}")
+        content_vector = generate_embeddings_aoai(doc['content'])
+        doc['contentVector'] = content_vector    
+
+    #Upload the documents to the index
+    search_manager.upload_documents(documents)
+
+    #Read in documents from a CSV file 
+    with open('ai_search/sample_data.csv', 'r') as f:
+        documents = []
+        for line in f:
+            line = line.strip().split(',')
+            doc = {
+                "id": line[0],
+                "date": line[1],
+                "category": line[2],
+                "sourceFileName": line[3],
+                "sourcePage": line[4],
+                "content": line[5]
+            }
+            documents.append(doc)
+
+    #Generate an embedding for each document's content
+    for doc in documents:
+        print(f"Generating embedding for document: {doc['id']}")
+        content_vector = generate_embeddings_aoai(doc['content'])
+        doc['contentVector'] = content_vector    
+
+    #Upload the documents to the index
+    search_manager.upload_documents(documents)
+
+    time.sleep(2)  # Wait for document indexing
+
+    # Perform simple searches
+    query = "artificial intelligence"
+
+    
+
+    print("\nSimple Text Search Results:")
+    text_results = search_manager.simple_text_search(query)
+    for result in text_results:
+        print(f"ID: {result['id']}, Content: {result['content']}")
+
+    print("\nSimple Vector Search Results:")
+    vector_results = search_manager.simple_vector_search(query)
+    for result in vector_results:
+        print(f"ID: {result['id']}, Content: {result['content']}")
+
+    print("\nSimple Hybrid Search Results:")
+    hybrid_results = search_manager.simple_hybrid_search(query)
+    for result in hybrid_results:
+        print(f"ID: {result['id']}, Content: {result['content']}")
+
+    #delete the index - comment/uncomment as needed
+    search_manager.delete_index()
+    print("\n\nIndex deleted successfully")
+
+
+def example_2():
+
+    index_name = 'test_index'
+
+    #Create the search manager
+    search_manager = AISearchManager(search_index_name=index_name)
+
+
+    #Delete the index if it already exists
+    search_manager.delete_index()
+
+    config = {
+            "name": index_name,
+            "fields": [
+                SimpleField(name="id", type=SearchFieldDataType.String, key=True, filterable=True),
+                SimpleField(name="date", type=SearchFieldDataType.DateTimeOffset, filterable=True, facetable=True),
+                SimpleField(name="category", type=SearchFieldDataType.String, filterable=True, facetable=True),
+                SimpleField(name="sourceFileName", type=SearchFieldDataType.String, filterable=True),
+                SimpleField(name="sourcePage", type=SearchFieldDataType.String, filterable=True),
+                SearchableField(name="content", type=SearchFieldDataType.String),
+                SearchField(name="fileNameVector", type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
+                            searchable=True, vector_search_dimensions=1536, vector_search_profile_name="myHnswProfile"),
+                SearchField(name="contentVector", type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
+                            searchable=True, vector_search_dimensions=1536, vector_search_profile_name="myHnswProfile")
+            ],
+            "vector_search": VectorSearch(
+                algorithms=[
+                    HnswAlgorithmConfiguration(name="myHnsw")
+                ],
+                profiles=[
+                    VectorSearchProfile(
+                        name="myHnswProfile",
+                        algorithm_configuration_name="myHnsw",
+                    )
+                ]
+            )
+        }
+
+    search_manager.create_search_index_from_config(config)
+    
+
+    #Read in documents from a json file
+    with open('ai_search/sample_data.json', 'r') as f:
+        documents = json.load(f)
+
+    #Generate an embedding for each document's content
+    for doc in documents:
+        print(f"Generating embedding for document: {doc['id']}")
+        content_vector = generate_embeddings_aoai(doc['content'])
+        filename_vector = generate_embeddings_aoai(doc['sourceFileName'])
+        doc['contentVector'] = content_vector    
+        doc['fileNameVector'] = filename_vector
+
+    #Upload the documents to the index
+    search_manager.upload_documents(documents)
+
+    print("Waiting for document indexing...")
+    time.sleep(2)  # Wait for document indexing
+
+
+    #Run searches via a config file
+    with open('ai_search/hybrid_search.json', 'r') as config_file:
+        hybrid_search_config = json.load(config_file)
+
+    
+
+    # Define your search query
+    query = "artificial intelligence"
+
+    # Perform the dynamic search
+    results = search_manager.dynamic_search(query, hybrid_search_config)
+
+    # Print the results
+    print("\nDynamic Search Results:")
+    for result in results:
+        print(f"ID: {result['id']}, Content: {result['content']}")
+
+
+def create_indexes():
+
+
+
+    search_manager = AISearchManager()
+
+
+    #Index 1 - Simple index with some metadata fields, a content field, and two vector fields
+    config = {
+            "name": "test_index",
+            "fields": [
+                SimpleField(name="id", type=SearchFieldDataType.String, key=True, filterable=True),
+                SimpleField(name="date", type=SearchFieldDataType.DateTimeOffset, filterable=True, facetable=True),
+                SimpleField(name="category", type=SearchFieldDataType.String, filterable=True, facetable=True),
+                SimpleField(name="sourceFileName", type=SearchFieldDataType.String, filterable=True),
+                SimpleField(name="sourcePage", type=SearchFieldDataType.String, filterable=True),
+                SearchableField(name="content", type=SearchFieldDataType.String),
+                SearchField(name="fileNameVector", type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
+                            searchable=True, vector_search_dimensions=1536, vector_search_profile_name="myHnswProfile"),
+                SearchField(name="contentVector", type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
+                            searchable=True, vector_search_dimensions=1536, vector_search_profile_name="myHnswProfile")
+            ],
+            "vector_search": VectorSearch(
+                algorithms=[
+                    HnswAlgorithmConfiguration(name="myHnsw")
+                ],
+                profiles=[
+                    VectorSearchProfile(
+                        name="myHnswProfile",
+                        algorithm_configuration_name="myHnsw",
+                    )
+                ]
+            )
+        }
+
+    search_manager.create_search_index_from_config(config)
+
+
+
+    #Index 2 - an index with custom scoring profiles
+    category_scoring_profile = ScoringProfile(
+        name="categoryScoringProfile",
+        functions=[
+            TagScoringFunction(
+                field_name="category",
+                boost=5,
+                parameters=TagScoringParameters(tags_parameter="category"),
+                interpolation=ScoringFunctionInterpolation.LINEAR
+            )
+        ],
+        function_aggregation=ScoringFunctionAggregation.SUM
+        )
+
+
+    temporalId_scoring_profile = ScoringProfile(
+        name="temporalIdScoringProfile",
+        functions=[
+            FreshnessScoringFunction(
+                field_name="date",
+                boost=2,
+                parameters=FreshnessScoringParameters(boosting_duration="P1095D"),
+                interpolation=ScoringFunctionInterpolation.LINEAR
+            )
+    ],
+    function_aggregation=ScoringFunctionAggregation.SUM
+)
+
+    config = {
+            "name": "test_index_with_scoring_profile",
+            "fields": [
+                SimpleField(name="id", type=SearchFieldDataType.String, key=True, filterable=True),
+                SimpleField(name="date", type=SearchFieldDataType.DateTimeOffset, filterable=True, facetable=True),
+                SimpleField(name="category", type=SearchFieldDataType.String, filterable=True, facetable=True),
+                SimpleField(name="sourceFileName", type=SearchFieldDataType.String, filterable=True),
+                SimpleField(name="sourcePage", type=SearchFieldDataType.String, filterable=True),
+                SearchableField(name="content", type=SearchFieldDataType.String),
+                SearchField(name="contentVector", type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
+                            searchable=True, vector_search_dimensions=1536, vector_search_profile_name="myHnswProfile")
+            ],
+            "vector_search": VectorSearch(
+                algorithms=[
+                    HnswAlgorithmConfiguration(name="myHnsw")
+                ],
+                profiles=[
+                    VectorSearchProfile(
+                        name="myHnswProfile",
+                        algorithm_configuration_name="myHnsw",
+                    )
+                ]
+            ),
+            'scoring_profiles': [category_scoring_profile, temporalId_scoring_profile]
+        }
+
+
+
+    search_manager.create_search_index_from_config(config)
+
+
+
+def upload_documents():
+
+    search_manager = AISearchManager(search_index_name='test_index')
+
+    #Read in documents from a json file
+    with open('ai_search/sample_data.json', 'r') as f:
+        documents_1 = json.load(f)
+
+    # Generate an embedding for each document's content
+    for doc in documents_1:
+        print(f"Generating embedding for document: {doc['id']}")
+        content_vector = generate_embeddings_aoai(doc['content'])
+        filename_vector = generate_embeddings_aoai(doc['sourceFileName'])
+        doc['contentVector'] = content_vector    
+        doc['fileNameVector'] = filename_vector 
+
+    #Upload the documents to the index
+    search_manager.upload_documents(documents_1)
+
+
+    # Read in documents from a CSV file
+    with open('ai_search/sample_data.csv', 'r', newline='') as f:
+        reader = csv.DictReader(f)
+        documents_2 = []
+        for row in reader:
+            doc = {
+                "id": row["id"],
+                "date": row["date"],
+                "category": row["category"],
+                "sourceFileName": row["sourceFileName"],
+                "sourcePage": row["sourcePage"],
+                "content": row["content"]
+            }
+            documents_2.append(doc)
+
+
+    # Generate an embedding for each document's content
+    for doc in documents_2:
+        print(f"Generating embedding for document: {doc['id']}")
+        content_vector = generate_embeddings_aoai(doc['content'])
+        filename_vector = generate_embeddings_aoai(doc['sourceFileName'])
+        doc['contentVector'] = content_vector    
+        doc['fileNameVector'] = filename_vector
+
+    #Upload the documents to the index
+    search_manager.upload_documents(documents_2)
+
+    #Upload the documents to the other indexes
+    search_manager.search_index_name = 'test_index_with_scoring_profile'
+    search_manager.upload_documents(documents_1)
+    search_manager.upload_documents(documents_2)
+
+
+def simple_searches():
+
+    search_manager = AISearchManager(search_index_name='test_index')
+
+    query = "artificial intelligence"
+
+
+    print("\nSimple Text Search Results:")
+    text_results = search_manager.simple_text_search(query)
+    for result in text_results:
+        print(f"ID: {result['id']}, Content: {result['content']}")
+
+    print("\nSimple Vector Search Results:")
+    vector_results = search_manager.simple_vector_search(query)
+    for result in vector_results:
+        print(f"ID: {result['id']}, Content: {result['content']}")
+
+    print("\nSimple Hybrid Search Results:")
+    hybrid_results = search_manager.simple_hybrid_search(query)
+    for result in hybrid_results:
+        print(f"ID: {result['id']}, Content: {result['content']}")
+
+    print("\n\nSimple Hybrid search with reranker Results:")
+    hybrid_with_reranker_results = search_manager.hybrid_search_simple_reranker(query)
+    for result in hybrid_with_reranker_results:
+        print(f"ID: {result['id']}, Content: {result['content']}")
+
+if __name__ == "__main__":
+
+
+
+
+    #create_indexes()
+
+    #upload_documents()
+
+    simple_searches()
+--------------------------------------------------------------------------------
+<File: reusable_samples\ai_search\hybrid_search reranker.json>
+{
+    "top": 3,
+    "select": ["id", "content"],
+    "text_fields": ["content"],
+    "vector_fields": ["contentVector"],
+    "k_nearest_neighbors": 3
+}
+--------------------------------------------------------------------------------
+<File: reusable_samples\ai_search\hybrid_search.json>
+{
+    "top": 3,
+    "select": ["id", "content"],
+    "text_fields": ["content"],
+    "vector_fields": ["contentVector"],
+    "k_nearest_neighbors": 3
+}
+--------------------------------------------------------------------------------
+<File: reusable_samples\ai_search\sample_data.csv>
+17,2024-01-15T08:30:00Z,Technology,tech_article_02.pdf,1,"Edge computing is gaining traction as a way to process data closer to its source, reducing latency and improving efficiency. This technology is particularly important for IoT devices and real-time applications."
+18,2024-03-22T14:45:22Z,Technology,tech_article_02.pdf,2,"The development of 6G networks is already underway, promising even faster speeds and lower latency than 5G. This next-generation technology could enable new applications in areas like holographic communication and Internet of Senses."
+19,2024-06-11T11:12:33Z,Technology,tech_article_03.pdf,1,"Neuromorphic computing, which mimics the structure and function of the human brain, is showing promise in creating more efficient and adaptable AI systems. This could lead to significant advancements in machine learning and robotics."
+20,2024-02-05T09:55:18Z,Health,health_article_03.pdf,1,"The field of epigenetics is shedding new light on how lifestyle factors can influence gene expression. This research is leading to new approaches in preventive medicine and personalized health strategies."
+21,2024-04-30T16:20:45Z,Health,health_article_03.pdf,2,"Telemedicine has become a permanent fixture in healthcare delivery, improving access to medical services for remote and underserved populations. Continued advancements in this area are expected to further transform patient care."
+22,2024-07-18T13:40:09Z,Health,health_article_04.pdf,1,"The gut microbiome is emerging as a crucial factor in overall health. Research into the complex interactions between gut bacteria and various bodily systems is opening up new avenues for treating a wide range of conditions."
+23,2024-09-03T10:05:30Z,Finance,finance_article_03.pdf,1,"The rise of central bank digital currencies (CBDCs) is reshaping the global financial landscape. These government-backed digital currencies could have significant implications for monetary policy and financial inclusion."
+24,2024-11-27T15:50:12Z,Finance,finance_article_03.pdf,2,"Impact investing is gaining momentum as investors seek to generate positive social and environmental outcomes alongside financial returns. This approach is driving capital towards sustainable development and social enterprises."
+25,2024-08-14T12:25:55Z,Finance,finance_article_04.pdf,1,"The gig economy continues to grow, presenting both opportunities and challenges for workers and policymakers. New financial products and services are emerging to cater to the unique needs of freelancers and independent contractors."
+26,2024-05-09T17:30:40Z,Education,education_article_03.pdf,1,"Gamification is being increasingly integrated into educational strategies, making learning more engaging and interactive. This approach has shown promise in improving student motivation and knowledge retention."
+27,2024-10-02T09:15:23Z,Education,education_article_03.pdf,2,"The concept of micro-credentials is gaining traction in higher education and professional development. These bite-sized qualifications allow learners to acquire specific skills and knowledge in a more flexible and targeted manner."
+28,2024-12-19T14:55:08Z,Education,education_article_04.pdf,1,"Virtual reality (VR) and augmented reality (AR) are being used to create immersive learning experiences across various disciplines. From virtual field trips to interactive simulations, these technologies are enhancing education in unprecedented ways."
+29,2024-03-08T11:40:37Z,Entertainment,entertainment_article_02.pdf,1,"The metaverse is blurring the lines between gaming, social media, and virtual events. This convergence of technologies is creating new forms of entertainment and social interaction."
+30,2024-06-25T18:20:15Z,Entertainment,entertainment_article_02.pdf,2,"AI-generated content, including music, art, and writing, is becoming increasingly sophisticated. This trend is raising questions about creativity, authorship, and the future of human artists in the entertainment industry."
+--------------------------------------------------------------------------------
+<File: reusable_samples\ai_search\sample_data.json>
+[
+    {
+      "id": "1",
+      "date": "2023-08-14T12:34:56Z",
+      "category": "Technology",
+      "sourceFileName": "tech_article_01.pdf",
+      "sourcePage": "1",
+      "content": "The tech world is abuzz with the latest advancements in artificial intelligence. From self-driving cars to AI-powered personal assistants, the possibilities seem endless. However, ethical concerns and the potential impact on the job market remain hot topics of debate."
+    },
+    {
+      "id": "2",
+      "date": "2023-01-22T09:12:34Z",
+      "category": "Technology",
+      "sourceFileName": "tech_article_01.pdf",
+      "sourcePage": "2",
+      "content": "Quantum computing is another area generating significant excitement. While still in its early stages, it has the potential to revolutionize fields like medicine, materials science, and financial modeling by solving problems that are currently intractable for classical computers."
+    },
+    {
+      "id": "3",
+      "date": "2023-05-03T17:56:12Z",
+      "category": "Technology",
+      "sourceFileName": "tech_article_01.pdf",
+      "sourcePage": "3",
+      "content": "The rise of the metaverse is blurring the lines between the physical and digital worlds. Virtual reality and augmented reality technologies are creating immersive experiences that are transforming the way we work, play, and interact with each other."
+    },
+    {
+      "id": "4",
+      "date": "2023-11-11T21:43:09Z",
+      "category": "Health",
+      "sourceFileName": "health_article_01.pdf",
+      "sourcePage": "1",
+      "content": "Maintaining a healthy lifestyle is crucial in today's fast-paced world. Regular exercise, a balanced diet, and adequate sleep are essential for physical and mental well-being. Mindfulness and stress management techniques are also gaining popularity."
+    },
+    {
+      "id": "5",
+      "date": "2023-07-04T10:23:45Z",
+      "category": "Health",
+      "sourceFileName": "health_article_01.pdf",
+      "sourcePage": "2",
+      "content": "The importance of mental health is finally being recognized.  Seeking help for conditions like anxiety and depression is becoming more socially acceptable, and innovative therapies are emerging to address the growing need for mental health support."
+    },
+    {
+      "id": "6",
+      "date": "2023-03-18T15:32:11Z",
+      "category": "Health",
+      "sourceFileName": "health_article_02.pdf",
+      "sourcePage": "1",
+      "content": "The COVID-19 pandemic has had a profound impact on global health. While vaccines have been developed, the long-term effects of the virus are still being studied. Public health measures and individual responsibility remain crucial in preventing future outbreaks." 
+    },
+    {
+      "id": "7",
+      "date": "2023-09-27T08:15:23Z",
+      "category": "Health",
+      "sourceFileName": "health_article_02.pdf",
+      "sourcePage": "2",
+      "content": "Personalized medicine is revolutionizing healthcare. By tailoring treatments to an individual's genetic makeup and lifestyle, doctors can achieve better outcomes and minimize side effects. This approach holds great promise for the future of medicine."
+    },
+    {
+      "id": "8",
+      "date": "2023-02-05T19:45:34Z",
+      "category": "Finance",
+      "sourceFileName": "finance_article_01.pdf",
+      "sourcePage": "1",
+      "content": "The world of finance is constantly evolving. From cryptocurrency to decentralized finance (DeFi), new technologies are disrupting traditional systems. Investors need to stay informed about these trends to make sound financial decisions."
+    },
+    {
+      "id": "9",
+      "date": "2023-10-12T11:28:56Z",
+      "category": "Finance",
+      "sourceFileName": "finance_article_01.pdf",
+      "sourcePage": "2",
+      "content": "Financial literacy is becoming increasingly important. Understanding concepts like budgeting, investing, and debt management is essential for achieving financial stability and reaching long-term financial goals."
+    },
+    {
+      "id": "10",
+      "date": "2023-06-21T14:01:23Z",
+      "category": "Finance",
+      "sourceFileName": "finance_article_02.pdf",
+      "sourcePage": "1",
+      "content": "The global economy is facing numerous challenges. Inflation, rising interest rates, and geopolitical instability are creating uncertainty for businesses and investors. Adaptability and careful planning are crucial in navigating these turbulent times."
+    },
+    {
+      "id": "11",
+      "date": "2023-04-03T20:34:12Z",
+      "category": "Finance",
+      "sourceFileName": "finance_article_02.pdf",
+      "sourcePage": "2",
+      "content": "Sustainable investing is gaining momentum. Investors are increasingly considering environmental, social, and governance (ESG) factors when making investment decisions. This trend is driving positive change and creating new opportunities for businesses and investors alike."
+    },
+    {
+      "id": "12",
+      "date": "2023-12-28T16:56:45Z",
+      "category": "Education",
+      "sourceFileName": "education_article_01.pdf",
+      "sourcePage": "1",
+      "content": "The education landscape is undergoing a transformation. Online learning and personalized learning experiences are becoming more prevalent. Technology is playing an increasingly important role in the classroom, providing students with access to a wealth of resources and opportunities."
+    },
+    {
+      "id": "13",
+      "date": "2023-05-15T09:48:32Z",
+      "category": "Education",
+      "sourceFileName": "education_article_01.pdf",
+      "sourcePage": "2",
+      "content": "The importance of lifelong learning is being emphasized. Skills development and continuous education are essential for staying competitive in the job market and adapting to the changing demands of the modern world."
+    },
+    {
+      "id": "14",
+      "date": "2023-01-08T13:21:09Z",
+      "category": "Education",
+      "sourceFileName": "education_article_02.pdf",
+      "sourcePage": "1",
+      "content": "The future of work is changing rapidly. Automation and artificial intelligence are transforming industries, requiring workers to adapt and acquire new skills. The education system needs to prepare students for the jobs of tomorrow."
+    },
+    {
+      "id": "15",
+      "date": "2023-07-29T18:09:43Z",
+      "category": "Education",
+      "sourceFileName": "education_article_02.pdf",
+      "sourcePage": "2",
+      "content": "Creativity and critical thinking are becoming increasingly valuable skills. The ability to solve problems, think outside the box, and innovate is essential for success in the 21st century. Education should foster these skills in students."
+    },
+    {
+      "id": "16",
+      "date": "2023-02-19T22:56:21Z",
+      "category": "Entertainment",
+      "sourceFileName": "entertainment_article_01.pdf",
+      "sourcePage": "1",
+      "content": "The entertainment industry is constantly evolving. Streaming services have revolutionized the way we consume movies and TV shows. The rise of social media has given creators new platforms to reach audiences and build communities."
+    }
+]
+--------------------------------------------------------------------------------
+<File: reusable_samples\ai_search\text_search.json>
+{
+        "top": 3,
+        "select": ["id", "content"],
+        "text_fields": ["content"]
+}
+--------------------------------------------------------------------------------
+<File: reusable_samples\ai_search\vector_search.json>
+{
+    "top": 3,
+    "select": ["id", "content"],
+    "vector_fields": ["contentVector", "fileNameVector"],
+    "k_nearest_neighbors": 3
+}
+--------------------------------------------------------------------------------
+<File: reusable_samples\azure_cosmos_db\cosmosdb.py>
+"""
+### cosmos_db.py ###
+
+This module handles interactions with Azure Cosmos DB, including database and container creation,
+and CRUD operations on documents. It automatically selects between key-based and DefaultAzureCredential
+authentication based on the presence of COSMOS_MASTER_KEY. Logging is configured to show only
+custom messages.
+
+Requirements:
+    azure-cosmos==4.5.1
+    azure-identity==1.12.0
+"""
+
+import os
+from typing import List, Dict, Any, Optional
+from dotenv import load_dotenv
+from azure.cosmos import CosmosClient, exceptions, PartitionKey
+from azure.cosmos.container import ContainerProxy
+from azure.cosmos.database import DatabaseProxy
+from azure.identity import DefaultAzureCredential
+
+class CosmosDBManager:
+    def __init__(self, cosmos_host=None, cosmos_database_id=None, cosmos_container_id=None):
+        self._load_env_variables(cosmos_host, cosmos_database_id, cosmos_container_id)
+        self.client = self._get_cosmos_client()
+        self.database: Optional[DatabaseProxy] = None
+        self.container: Optional[ContainerProxy] = None
+        self._initialize_database_and_container()
+
+    def _load_env_variables(self, cosmos_host=None, cosmos_database_id=None, cosmos_container_id=None):
+        load_dotenv()
+        self.cosmos_host = cosmos_host or os.environ.get("COSMOS_HOST")
+        self.cosmos_database_id = cosmos_database_id or os.environ.get("COSMOS_DATABASE_ID")
+        self.cosmos_container_id = cosmos_container_id or os.environ.get("COSMOS_CONTAINER_ID")
+        self.tenant_id = os.environ.get("TENANT_ID", '16b3c013-d300-468d-ac64-7eda0820b6d3')
+
+        if not all([self.cosmos_host, self.cosmos_database_id, self.cosmos_container_id]):
+            raise ValueError("Cosmos DB configuration is incomplete")
+
+    def _get_cosmos_client(self) -> CosmosClient:
+        print("Initializing Cosmos DB client")
+        print("Using DefaultAzureCredential for Cosmos DB authentication")
+        credential = DefaultAzureCredential(
+            interactive_browser_tenant_id=self.tenant_id,
+            visual_studio_code_tenant_id=self.tenant_id,
+            workload_identity_tenant_id=self.tenant_id,
+            shared_cache_tenant_id=self.tenant_id
+        )
+        return CosmosClient(self.cosmos_host, credential=credential)
+
+    def _initialize_database_and_container(self) -> None:
+        try:
+            self.database = self._create_or_get_database()
+            self.container = self._create_or_get_container()
+        except exceptions.CosmosHttpResponseError as e:
+            print(f'An error occurred: {e.message}')
+            raise
+
+    def _create_or_get_database(self) -> DatabaseProxy:
+        try:
+            database = self.client.create_database(id=self.cosmos_database_id)
+            print(f'Database with id \'{self.cosmos_database_id}\' created')
+        except exceptions.CosmosResourceExistsError:
+            database = self.client.get_database_client(self.cosmos_database_id)
+            print(f'Database with id \'{self.cosmos_database_id}\' was found')
+        return database
+
+    def _create_or_get_container(self) -> ContainerProxy:
+        try:
+            container = self.database.create_container(id=self.cosmos_container_id, partition_key=PartitionKey(path='/partitionKey'))
+            print(f'Container with id \'{self.cosmos_container_id}\' created')
+        except exceptions.CosmosResourceExistsError:
+            container = self.database.get_container_client(self.cosmos_container_id)
+            print(f'Container with id \'{self.cosmos_container_id}\' was found')
+        return container
+
+    def create_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Create a new item in the container. Fails if an item with the same ID already exists.
+
+        :param item: The item to create
+        :return: The created item, or None if creation failed
+        """
+        try:
+            created_item = self.container.create_item(body=item)
+            print(f"Item created with id: {created_item['id']}")
+            return created_item
+        except exceptions.CosmosResourceExistsError:
+            print(f"Item with id {item['id']} already exists. Use update_item or upsert_item to modify.")
+            return None
+        except exceptions.CosmosHttpResponseError as e:
+            print(f"An error occurred during creation: {e.message}")
+            return None
+
+    def update_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Update an existing item in the container. Fails if the item doesn't exist.
+
+        :param item: The item to update (must include 'id' and 'partitionKey')
+        :return: The updated item, or None if update failed
+        """
+        try:
+            updated_item = self.container.replace_item(item=item['id'], body=item)
+            print(f"Item updated with id: {updated_item['id']}")
+            return updated_item
+        except exceptions.CosmosResourceNotFoundError:
+            print(f"Item with id {item['id']} not found. Unable to update.")
+            return None
+        except exceptions.CosmosHttpResponseError as e:
+            print(f"An error occurred during update: {e.message}")
+            return None
+
+    def upsert_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Upsert (create or update) an item in the container.
+
+        :param item: The item to upsert
+        :return: The upserted item, or None if upsert failed
+        """
+        try:
+            upserted_item = self.container.upsert_item(body=item)
+            print(f"Item upserted with id: {upserted_item['id']}")
+            return upserted_item
+        except exceptions.CosmosHttpResponseError as e:
+            print(f"An error occurred during upsert: {e.message}")
+            return None
+
+    def query_items(self, query: str, parameters: Optional[List[Dict[str, Any]]] = None, partition_key: Optional[str] = None) -> List[Dict[str, Any]]:
+        try:
+            items = list(self.container.query_items(
+                query=query,
+                parameters=parameters,
+                partition_key=partition_key,
+                enable_cross_partition_query=(partition_key is None)
+            ))
+            print(f"Query returned {len(items)} items")
+            return items
+        except exceptions.CosmosHttpResponseError as e:
+            print(f"An error occurred during query: {e.message}")
+            return []
+
+    def delete_item(self, item_id: str, partition_key: str) -> bool:
+        try:
+            self.container.delete_item(item=item_id, partition_key=partition_key)
+            print(f"Item deleted with id: {item_id}")
+            return True
+        except exceptions.CosmosResourceNotFoundError:
+            print(f"Item with id {item_id} not found. Unable to delete.")
+            return False
+        except exceptions.CosmosHttpResponseError as e:
+            print(f"An error occurred during deletion: {e.message}")
+            return False
+
+def example_create_item():
+    cosmos_db = CosmosDBManager()
+    new_item = {
+        'id': 'item1',
+        'partitionKey': 'example_partition',
+        'name': 'John Doe',
+        'age': 30
+    }
+    created_item = cosmos_db.create_item(new_item)
+    if created_item:
+        print(f"Created item: {created_item}")
+    else:
+        print("Failed to create item. It might already exist.")
+
+def example_update_item():
+    cosmos_db = CosmosDBManager()
+    item_to_update = {
+        'id': 'item1',
+        'partitionKey': 'example_partition',
+        'name': 'John Doe',
+        'age': 31  # Updated age
+    }
+    updated_item = cosmos_db.update_item(item_to_update)
+    if updated_item:
+        print(f"Updated item: {updated_item}")
+    else:
+        print("Failed to update item. It might not exist.")
+
+def example_upsert_item():
+    cosmos_db = CosmosDBManager()
+    item_to_upsert = {
+        'id': 'item2',
+        'partitionKey': 'example_partition',
+        'name': 'Jane Doe',
+        'age': 28
+    }
+    upserted_item = cosmos_db.upsert_item(item_to_upsert)
+    if upserted_item:
+        print(f"Upserted item: {upserted_item}")
+    else:
+        print("Failed to upsert item.")
+
+def example_query_items():
+    cosmos_db = CosmosDBManager()
+    query = "SELECT * FROM c WHERE c.partitionKey = @partitionKey"
+    parameters = [{"name": "@partitionKey", "value": "example_partition"}]
+    items = cosmos_db.query_items(query, parameters)
+    print(f"Queried items: {items}")
+
+def example_delete_item():
+    cosmos_db = CosmosDBManager()
+    if cosmos_db.delete_item('item1', 'example_partition'):
+        print("Item deleted successfully")
+    else:
+        print("Failed to delete item")
+
+if __name__ == "__main__":
+    try:
+        example_create_item()
+        example_update_item()
+        example_upsert_item()
+        example_query_items()
+        example_delete_item()
+    except Exception as e:
+        print(f"An error occurred: {str(e)}")
+--------------------------------------------------------------------------------
+<File: reusable_samples\azure_document_intelligence\document_intelligence.py>
+"""
+### document_intelligence.py ###
+
+This module handles interactions with Azure Document Intelligence.
+It provides functionality to analyze documents stored in Azure Blob Storage or local files.
+
+Requirements:
+    azure-ai-documentintelligence==1.0.0b2
+    Azure Document Intelligence API Version: 2024-7-31 preview
+"""
+
+import os
+import logging
+from typing import Union
+from dotenv import load_dotenv
+from azure.core.credentials import AzureKeyCredential
+from azure.ai.documentintelligence import DocumentIntelligenceClient
+from azure.ai.documentintelligence.models import AnalyzeResult
+from azure.identity import DefaultAzureCredential
+
+# Set up logging
+logging.basicConfig(level=logging.WARNING)  # Set to WARNING to suppress INFO logs
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)  # Set our logger to INFO
+
+# Disable other loggers
+logging.getLogger('azure').setLevel(logging.WARNING)
+logging.getLogger('azure.ai.documentintelligence').setLevel(logging.WARNING)
+logging.getLogger('azure.identity').setLevel(logging.WARNING)
+
+class DocumentIntelligenceManager:
+    def __init__(self):
+        self._load_env_variables()
+        self.document_intelligence_client = self._get_document_intelligence_client()
+
+    def _load_env_variables(self):
+        load_dotenv()
+        self.document_intelligence_endpoint = os.environ.get("DOCUMENT_INTELLIGENCE_ENDPOINT")
+        self.document_intelligence_key = os.environ.get("DOCUMENT_INTELLIGENCE_KEY")
+        self.tenant_id = os.environ.get("TENANT_ID", '16b3c013-d300-468d-ac64-7eda0820b6d3')
+
+        if not self.document_intelligence_endpoint:
+            raise ValueError("DOCUMENT_INTELLIGENCE_ENDPOINT environment variable is not set")
+
+    def _get_document_intelligence_client(self) -> DocumentIntelligenceClient:
+        logger.info("Initializing Document Intelligence client")
+        if self.document_intelligence_key:
+            logger.info("Using key-based authentication for Document Intelligence")
+            credential = AzureKeyCredential(self.document_intelligence_key)
+        else:
+            logger.info("Using DefaultAzureCredential for Document Intelligence authentication")
+            credential = DefaultAzureCredential(
+                interactive_browser_tenant_id=self.tenant_id,
+                visual_studio_code_tenant_id=self.tenant_id,
+                workload_identity_tenant_id=self.tenant_id,
+                shared_cache_tenant_id=self.tenant_id
+            )
+        return DocumentIntelligenceClient(endpoint=self.document_intelligence_endpoint, credential=credential)
+
+    def read_document(self, document: Union[str, bytes], model_id: str) -> AnalyzeResult:
+        try:
+            if isinstance(document, str):
+                if document.startswith(('http://', 'https://')):
+                    logger.info(f"Reading document from URL: {document}")
+                    analyze_request = {"urlSource": document}
+                    poller = self.document_intelligence_client.begin_analyze_document(model_id, analyze_request)
+                elif os.path.isfile(document):
+                    logger.info(f"Reading document from local file: {document}")
+                    with open(document, "rb") as file:
+                        poller = self.document_intelligence_client.begin_analyze_document(model_id, analyze_request=file, content_type="application/octet-stream")
+                else:
+                    raise ValueError("Invalid document input. Expected URL or local file path.")
+            elif isinstance(document, bytes):
+                logger.info("Reading document from bytes content")
+                poller = self.document_intelligence_client.begin_analyze_document(model_id, analyze_request=document, content_type="application/octet-stream")
+            else:
+                raise ValueError("Invalid document input. Expected URL, local file path, or bytes.")
+
+            result = poller.result()
+            logger.info("Successfully read the document with Document Intelligence and extracted text.")
+            return result
+
+        except Exception as e:
+            logger.error(f"Error in read_document: {str(e)}")
+            raise
+
+def run_examples():
+    try:
+        doc_intelligence_manager = DocumentIntelligenceManager()
+        model_id = "prebuilt-layout"  # Use an appropriate model ID
+        
+        storage_account_name = os.environ.get("STORAGE_ACCOUNT_NAME")
+        storage_account_container = os.environ.get("STORAGE_ACCOUNT_CONTAINER", "documents")
+
+        # Example 1: Read a document from a blob URL
+        blob_url = f"https://{storage_account_name}.blob.core.windows.net/{storage_account_container}/337 Goldman Drive.pdf"
+        url_result = doc_intelligence_manager.read_document(blob_url, model_id)
+
+        for paragraph in url_result.paragraphs:
+            print(f"Detected paragraph: {paragraph.content}")
+            print(f"Page number: {paragraph.page_number}")
+
+        for pages in url_result.pages:
+            print(f"Detected page: {pages.content}")
+            #print page number
+            print(f"Page number: {pages.page_number}")
+
+        for tables in url_result.tables:
+            print(f"Detected table: {tables.content}")
+
+        logger.info("Document read from URL successfully")
+        
+        # Example 2: Read a document from a local file
+        local_file_path = "D:/temp/djg/337 Goldman Drive Inspection Report 20230730.pdf"
+        local_result = doc_intelligence_manager.read_document(local_file_path, model_id)
+        logger.info("Document read from local file successfully")
+        
+        # Example 3: Read a document from bytes content
+        with open(local_file_path, "rb") as f:
+            bytes_content = f.read()
+        bytes_result = doc_intelligence_manager.read_document(bytes_content, model_id)
+        logger.info("Document read from bytes content successfully")
+
+        # Process and display results
+        for i, result in enumerate([url_result, local_result, bytes_result], 1):
+            print(f"Example {i} - Extracted text:")
+            print(result.content[:500] + "..." if len(result.content) > 500 else result.content)
+            print("\n")
+
+    except Exception as e:
+        logger.error(f"An error occurred: {str(e)}")
+
+if __name__ == "__main__":
+    run_examples()
+--------------------------------------------------------------------------------
+<File: reusable_samples\azure_openai\aoai.py>
+"""
+###aoai.py###
+
+This module handles interactions with Azure OpenAI (AOAI) directly through the SDK without using orchestrators or frameworks.
+
+Requirements:
+    openai==1.46.1
+    gpt4o model version: 2024-08-06 
+    API version: 2024-08-01 preview
+"""
+
+import os
+from typing import List, Dict, Optional, Union
+from dotenv import load_dotenv
+from pydantic import BaseModel
+from openai import AzureOpenAI
+import openai
+from openai.types import CreateEmbeddingResponse
+import base64
+
+# Load environment variables
+load_dotenv()
+
+API_VERSION = "2024-08-01-preview"
+
+# Azure OpenAI configuration
+aoai_deployment = os.environ.get("AOAI_DEPLOYMENT")
+aoai_key = os.environ.get("AOAI_KEY")
+aoai_endpoint = os.environ.get("AOAI_ENDPOINT")
+
+print(f"AOAI Endpoint: {aoai_endpoint}")
+print(f"AOAI Deployment: {aoai_deployment}")
+print(f"AOAI Key: {aoai_key[:5] + '*' * (len(aoai_key) - 5) if aoai_key else None}")
+
+# Initialize Azure OpenAI client
+try:
+    aoai_client = AzureOpenAI(
+        azure_endpoint=aoai_endpoint,
+        api_key=aoai_key,
+        api_version=API_VERSION
+    )
+except Exception as e:
+    print(f"Failed to initialize Azure OpenAI client: {e}")
+    raise
+
+def generate_embeddings_aoai(text: str, model: str = "text-embedding-ada-002") -> Optional[CreateEmbeddingResponse]:
+    """
+    Generate embeddings for the given text using Azure OpenAI.
+
+    Parameters:
+    - text (str): The input text to generate embeddings for.
+    - model (str): The name of the embedding model to use. Defaults to "text-embedding-ada-002".
+
+    Returns:
+    - Optional[CreateEmbeddingResponse]: The embedding response from Azure OpenAI, or None if an error occurs.
+      The response contains the generated embeddings and related information.
+
+    This function takes a piece of text and converts it into a numerical representation (embedding)
+    using the specified Azure OpenAI model. These embeddings can be used for various natural language
+    processing tasks such as semantic search or text classification.
+    """
+    try:
+        response = aoai_client.embeddings.create(input=[text], model=model)
+        return response.data[0].embedding
+    except Exception as e:
+        print(f"Error generating embeddings: {e}")
+        return None
+
+def inference_aoai(messages: List[Dict[str, Union[str, List[Dict[str, Union[str, Dict[str, str]]]]]]], deployment: str) -> dict:
+    """
+    Perform a basic inference task using Azure OpenAI.
+
+    Parameters:
+    - messages (List[Dict]): A list of message dictionaries. Each dictionary should have a 'role' key
+      (either 'system', 'user', or 'assistant') and a 'content' key. The 'content' can be either a string
+      for text-only messages or a list of dictionaries for messages that include images.
+    - deployment (str): The name of the Azure OpenAI deployment to use.
+
+    Returns:
+    - dict: The response from Azure OpenAI, or None if an error occurs. The response includes
+      the generated text and other metadata.
+
+    This function sends the provided messages to Azure OpenAI and returns the model's response.
+    It can handle both text-only inputs and inputs that include images. For image inputs, the message
+    content should be a list where one of the items is a dictionary with an 'image_url' key.
+    """
+    try:
+        response = aoai_client.chat.completions.create(
+            model=deployment,
+            messages=messages
+        )
+        return response
+    except Exception as e:
+        print(f"Error in inference: {e}")
+        return None
+
+def inference_structured_output_aoai(messages: List[Dict[str, Union[str, List[Dict[str, Union[str, Dict[str, str]]]]]]], deployment: str, schema: BaseModel) -> dict:
+    """
+    Perform an inference task with structured output using Azure OpenAI.
+
+    Parameters:
+    - messages (List[Dict]): A list of message dictionaries. Each dictionary should have a 'role' key
+      (either 'system', 'user', or 'assistant') and a 'content' key. The 'content' can be either a string
+      for text-only messages or a list of dictionaries for messages that include images.
+    - deployment (str): The name of the Azure OpenAI deployment to use.
+    - schema (BaseModel): A Pydantic model that defines the structure of the expected output.
+
+    Returns:
+    - dict: The parsed response from Azure OpenAI, or None if an error occurs. The response includes
+      the generated content structured according to the provided schema.
+
+    This function sends the provided messages to Azure OpenAI and returns the model's response
+    parsed according to the given schema. It can handle both text-only inputs and inputs that
+    include images, similar to the inference_aoai function.
+    """
+    try:
+        completion = aoai_client.beta.chat.completions.parse(
+            model=deployment,
+            messages=messages,
+            response_format=schema,
+        )
+        print("Structured output inference completed")
+        print(f"Completion content: {completion.choices[0].message.content}")
+        print(f"Parsed event: {completion.choices[0].message.parsed}")
+        return completion
+    except Exception as e:
+        print(f"Error in structured output inference: {e}")
+        return None
+
+def tool_inference_aoai(messages: List[Dict[str, str]], deployment: str, tools: List[Dict]) -> dict:
+    """
+    Perform an inference task using tools (functions) with Azure OpenAI.
+
+    Parameters:
+    - messages (List[Dict]): A list of message dictionaries. Each dictionary should have a 'role' key
+      (either 'system', 'user', or 'assistant') and a 'content' key containing the message text.
+    - deployment (str): The name of the Azure OpenAI deployment to use.
+    - tools (List[Dict]): A list of tool definitions. Each tool should be a dictionary describing
+      a function that the model can call.
+
+    Returns:
+    - dict: The response from Azure OpenAI, or None if an error occurs. The response includes
+      the generated text, any tool calls made by the model, and other metadata.
+
+    This function allows the Azure OpenAI model to use defined tools (functions) as part of its
+    response generation process. It's useful for tasks where the model might need to call
+    external functions or APIs to complete a task.
+    """
+    try:
+        response = aoai_client.chat.completions.create(
+            model=deployment,
+            messages=messages,
+            tools=tools
+        )
+        print("Tool inference completed")
+        print(f"Function Call: {response.choices[0].message.tool_calls[0].function}")
+        return response
+    except Exception as e:
+        print(f"Error in tool inference: {e}")
+        return None
+
+def stream_inference_aoai(messages: List[Dict[str, str]], deployment: str) -> str:
+    """
+    Perform a streaming inference task using Azure OpenAI.
+
+    Parameters:
+    - messages (List[Dict]): A list of message dictionaries. Each dictionary should have a 'role' key
+      (either 'system', 'user', or 'assistant') and a 'content' key containing the message text.
+    - deployment (str): The name of the Azure OpenAI deployment to use.
+
+    Returns:
+    - str: The full response content as a string, or an empty string if an error occurs.
+
+    This function sends the provided messages to Azure OpenAI and streams the response back.
+    It prints each chunk of the response as it's received and returns the full response at the end.
+    This is useful for long-form content generation where you want to see the output in real-time.
+    """
+    try:
+        response = aoai_client.chat.completions.create(
+            model=deployment,
+            messages=messages, 
+            stream=True
+        )
+
+        full_response = ""
+        for chunk in response:
+            if chunk.choices:
+                delta = chunk.choices[0].delta
+                if delta and delta.content is not None:
+                    full_response += delta.content
+                    print(delta.content, end='', flush=True)
+        print('\n\n')
+
+        return full_response
+    except Exception as e:
+        print(f"Error in streaming chat completion: {e}")
+        return ""
+
+def example_generate_embeddings():
+    """Example usage of generate_embeddings_aoai function."""
+    text = "Hello, world!"
+    response = generate_embeddings_aoai(text)
+    if response:
+        print(f"Embedding for '{text}': {response.data[0].embedding[:5]}...")  # Print first 5 values
+    else:
+        print("Failed to generate embeddings")
+
+def example_basic_inference():
+    """Example usage of inference_aoai function for basic text inference."""
+    messages = [
+        {"role": "system", "content": "You are a helpful AI assistant"},
+        {"role": "user", "content": "What is the capital of France?"}
+    ]
+    response = inference_aoai(messages, aoai_deployment)
+    if response:
+        print(f"Basic inference response: {response.choices[0].message.content}")
+    else:
+        print("Failed to process basic inference")
+
+def example_structured_output():
+    """Example usage of inference_structured_output_aoai function."""
+    class CalendarEvent(BaseModel):
+        name: str
+        date: str
+        participants: list[str]
+
+    messages = [
+        {"role": "system", "content": "Extract the event information."},
+        {"role": "user", "content": "Alice and Bob are going to a science fair on Friday."},
+    ]
+
+    result = inference_structured_output_aoai(messages, aoai_deployment, CalendarEvent)
+    if result:
+        new_event = CalendarEvent(**result.choices[0].message.parsed.dict())
+        print(f"Event name: {new_event.name}")
+        print(f"Event date: {new_event.date}")
+        print(f"Event participants: {new_event.participants}")
+    else:
+        print("Failed to process structured output")
+
+def example_tool_inference():
+    """Example usage of tool_inference_aoai function."""
+    class GetDeliveryDate(BaseModel):
+        order_id: str
+
+    tools = [openai.pydantic_function_tool(GetDeliveryDate)]
+
+    messages = [
+        {"role": "system", "content": "You are a helpful customer support assistant. Use the supplied tools to assist the user."},
+        {"role": "user", "content": "Hi, can you tell me the delivery date for my order #12345?"}
+    ]
+
+    response = tool_inference_aoai(messages, aoai_deployment, tools)
+    if response:
+        function_call = response.choices[0].message.tool_calls[0].function
+        print(f"Function called: {function_call.name}")
+        print(f"Arguments: {function_call.arguments}")
+        print(f"Total tokens used: {response.usage.total_tokens}")
+    else:
+        print("Failed to process tool inference")
+
+def example_stream_inference():
+    """Example usage of stream_inference_aoai function."""
+    messages = [
+        {"role": "system", "content": "You are a helpful AI assistant"},
+        {"role": "user", "content": "What color is the sky?"},
+    ]
+
+    full_response = stream_inference_aoai(messages, aoai_deployment)
+    print("Streaming completed successfully")
+    print(f"Full response: {full_response}")
+
+def example_image_processing():
+    """Example usage of inference_aoai function for image processing."""
+    with open("D:/temp/tmp/buttermilk-pancakes.jpg", "rb") as image_file:
+        image_base64 = base64.b64encode(image_file.read()).decode('utf-8')
+
+    image_messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe what you see in this image."},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
+            ]
+        }
+    ]
+    image_response = inference_aoai(image_messages, aoai_deployment)
+    if image_response:
+        print(f"Image description: {image_response.choices[0].message.content}")
+    else:
+        print("Failed to process image")
+
+def example_structured_image_processing():
+    """Example usage of inference_structured_output_aoai function for image processing with structured output."""
+    with open("D:/temp/tmp/buttermilk-pancakes.jpg", "rb") as image_file:
+        image_base64 = base64.b64encode(image_file.read()).decode('utf-8')
+
+    class OutputStructure(BaseModel):
+        text: str
+        image_insights: str
+
+    image_prompt = """You will be given an image that is one or more pages of a document, along with some analysis of the overall document. 
+
+    Output the following fields:
+    text: The verbatim text of the page in markdown format. 
+    image_insights: All insights or information that can be gleaned from the images on the page and the relationship to the text. 
+
+    If there are no images, output 'na' for image_insights."""
+
+    structured_image_messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": image_prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
+            ]
+        }
+    ]
+
+    structured_image_response = inference_structured_output_aoai(structured_image_messages, aoai_deployment, OutputStructure)
+    if structured_image_response:
+        parsed_response = OutputStructure(**structured_image_response.choices[0].message.parsed.dict())
+        print(f"Structured Image Text: {parsed_response.text}")
+        print(f"Structured Image Insights: {parsed_response.image_insights}")
+    else:
+        print("Failed to process structured image output")
+
+
+if __name__ == "__main__":
+    print("Running examples for Azure OpenAI functions:")
+    
+    print("\n1. Generating Embeddings:")
+    example_generate_embeddings()
+    
+    print("\n2. Basic Inference:")
+    example_basic_inference()
+    
+    print("\n3. Structured Output Inference:")
+    example_structured_output()
+    
+    print("\n4. Tool Inference:")
+    example_tool_inference()
+    
+    print("\n5. Stream Inference:")
+    example_stream_inference()
+    
+    print("\n6. Image Processing:")
+    example_image_processing()
+    
+    print("\n7. Structured Image Processing:")
+    example_structured_image_processing()
+
+    print("\nAll examples completed.")
+--------------------------------------------------------------------------------
+<File: reusable_samples\document_ingestion\chunking.py>
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_text_splitters import TokenTextSplitter
+from langchain_experimental.text_splitter import SemanticChunker
+from langchain_openai.embeddings import AzureOpenAIEmbeddings
+
+import os
+import tiktoken
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Azure OpenAI configuration
+aoai_deployment = os.getenv("AOAI_DEPLOYMENT")
+aoai_key = os.getenv("AOAI_KEY")
+aoai_endpoint = os.getenv("AOAI_ENDPOINT")
+
+#Embeddings model
+embeddings_model = AzureOpenAIEmbeddings(
+    model="text-embedding-ada-002",
+    azure_endpoint=aoai_endpoint,
+    openai_api_key=aoai_key
+)
+
+encoding = tiktoken.encoding_for_model("gpt-4o")
+
+def num_tokens_from_string(string):
+    return len(encoding.encode(string))
+
+def semantic_chunking_langchain(full_text):
+    breakpoint_type = "interquartile"
+    
+    text_splitter = SemanticChunker(embeddings_model, breakpoint_threshold_type=breakpoint_type)
+    chunks = text_splitter.split_text(full_text)
+    total_tokens = 0
+    
+    for i, chunk in enumerate(chunks):
+        token_count = num_tokens_from_string(chunk)
+        length = len(chunk)
+        print(f"******************Chunk {i}: Tokens: {token_count}******************")
+        print(chunk)
+        total_tokens += token_count
+    
+    return chunks
+
+def chunk_by_tokens_langchain(full_text, chunk_size=1000, chunk_overlap=100):
+    text_splitter = TokenTextSplitter(encoding_name='gpt2', chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    
+    chunks = text_splitter.split_text(full_text)
+    total_tokens = 0
+    for chunk in chunks:
+        token_count = num_tokens_from_string(chunk)
+        total_tokens += token_count
+    
+    return chunks
+
+def recursive_character_chunking_langchain(full_text):
+    # Get token count of the full_text
+    token_count = num_tokens_from_string(full_text)
+    print(f"Number of tokens: {token_count}")
+    print(f"Length of full text: {len(full_text)}")
+    
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=2500,
+        chunk_overlap=250,
+        length_function=len,
+        is_separator_regex=False,
+    )
+    texts = text_splitter.split_text(full_text)
+    
+    total_tokens = 0
+    for chunk in texts:
+        token_count = num_tokens_from_string(chunk)
+        length = len(chunk)
+        print(f"Tokens: {token_count}")
+        total_tokens += token_count
+    
+    return texts
+
+def run_examples():
+    # Instead of reading from a file, you would pass the text directly
+    sample_text = "Your sample text goes here..."
+    
+    # Choose one of the functions to run
+    chunks = semantic_chunking_langchain(sample_text)
+    # chunks = chunk_by_tokens_langchain(sample_text)
+    # chunks = recursive_character_chunking_langchain(sample_text)
+    
+    print(f"Total chunks returned: {len(chunks)}")
+
+# Run the examples
+if __name__ == "__main__":
+    run_examples()
+--------------------------------------------------------------------------------
+<File: reusable_samples\document_ingestion\multimodal_docprep.py>
+###Multimodal_docprep.py###
+
+import os
+import io
+import base64
+import json
+from pdf2image import convert_from_path
+from openai import AzureOpenAI
+#import fitz  # PyMuPDF
+from PIL import Image
+from pydantic import BaseModel
+from PyPDF2 import PdfReader
+#local imports
+from aoai import inference_structured_output_aoai, inference_aoai
+
+from adls import ADLSManager  # Import the ADLSManager class
+API_VERSION = "2024-08-01-preview"
+
+# Azure OpenAI configuration
+aoai_deployment = os.environ.get("AOAI_DEPLOYMENT_NAME")
+aoai_key = os.environ.get("AOAI_API_KEY")
+aoai_endpoint = os.environ.get("AOAI_ENDPOINT")
+
+
+storage_account_conn_str = os.environ.get("STORAGE_ACCOUNT_CONNECTION_STRING")
+storage_account_container = os.environ.get("STORAGE_ACCOUNT_CONTAINER")
+storage_account_name = os.environ.get("STORAGE_ACCOUNT_NAME")
+
+
+# Initialize Azure OpenAI client
+aoai_client = AzureOpenAI(
+        azure_endpoint=aoai_endpoint,
+        api_key=aoai_key,
+        api_version=API_VERSION)
+
+document_structure_analyzer_prompt = """You are responsible for analyzing a document to determine its topic and top-level sections.
+
+Output the following fields:
+Summary: A brief description of the document type and its purpose. Make sure to include who/what the main subjects are.
+Top-level Sections: What are the top-level sections of the document? 
+
+
+###Examples###
+User: (a large document of a home inspection report)
+Assistant: 
+Summary: Home Inspection Report for 337 Goldman Drive, Phoenixville, PA 19460, the home of Dan Giannone.
+Top-level Sections: General Information
+Introduction and Structural Overview
+Purpose and Scope
+Roof System
+Exteriors
+Electrical System
+Heating and Cooling
+Fireplaces and Chimneys
+Plumbing System
+Interiors
+Basement and Crawlspace
+Attic Area and Roof Framing
+Appliances
+NACHI Standards of Practice
+
+"""
+
+
+image_prompt = """You will be given an image that is one or more pages of a document, along with some analysis of the overall document. 
+
+
+###Output Structure###
+{
+text: The verbatim text of the page in markdown format. 
+images: A 1 sentence description of any images on the page and how they relate to the text.
+image_insights: All insights or information that can be gleaned from the images on the page and the relationship to the text. 
+}
+
+###Guidance###
+
+1. Output 'na' for images or image_insights if there are no images or diagrams. Do not consider tables images as you will be capturing them via text.
+2. When outputting markdown, keep in mind that you are only looking at one page of a much larger document, so only consider something a section header if you feel very confident it could be a section header for this type of document.
+3. In the text, make sure to indicate where the images are located on the page with [] brackets.
+4. Use the surrounding text to provide context to the image & extract further insights from it. For example, if the text describes a picture of a house with "ADDRESS" listed below it, you can assume the image of the house is that address. Be as descriptive as possible. Just explain, do not start with "the image is..."
+5. Only use markdown H2 headers for the top-level sections mentioned in the document structure analysis. Everything else should be a H3 or lower or some other markdown element.
+
+###Examples###
+
+User: (an image of the following text & picture) 
+<document analysis>
+Summary: Home Inspection Report for 337 Goldman Drive, Phoenixville, PA 19460, the home of Dan Giannone.
+top-level sections: General Information
+Introduction and Structural Overview
+Purpose and Scope
+Roof System
+Exteriors
+Electrical System
+Heating and Cooling
+Fireplaces and Chimneys
+Plumbing System
+Interiors
+Basement and Crawlspace
+Attic Area and Roof Framing
+Appliances
+NACHI Standards of Practice
+
+<Content>
+LDS Inspections
+A Division of Lennox Design Studios
+
+2801 Soni Drive Trooper, PA 19403
+Phone: 610-277-4953 Fax: 610-277-4954
+WWW.LDSINSPECTIONS.COM
+
+Home Inspection Report For
+
+---
+
+(Image of a house)
+
+337 Goldman Drive
+Phoenixville, PA 19460
+
+---
+
+Report Prepared For
+Dan Giannone
+
+Report Prepared By
+Craig Lennox
+
+
+Assistant:
+
+text: 
+# LDS Inspections
+**A Division of Lennox Design Studios**
+
+2801 Soni Drive Trooper, PA 19403  
+Phone: 610-277-4953 Fax: 610-277-4954  
+[WWW.LDSINSPECTIONS.COM](http://www.ldsinspections.com)
+
+**Home Inspection Report For**
+
+---
+
+[Image]
+
+**337 Goldman Drive  
+Phoenixville, PA 19460**
+
+---
+
+*Report Prepared For*  
+**Dan Giannone**
+
+*Report Prepared By*  
+**Craig Lennox**
+
+image_insights: 337 Goldman Dr, a large two-story suburban house owned by Dan Giannone. The house has the following features:
+
+White exterior with light blue or gray trim
+Multiple peaked roof sections
+Several windows, including some arched windows on the upper floor
+Two-car garage with white doors
+Paved driveway with two vehicles parked in it (appear to be dark-colored sedans or similar)
+Well-maintained front lawn
+Some landscaping, including a small tree or bush with reddish foliage near the front of the house
+Part of a neighboring house visible on the left side
+Clear blue sky visible
+
+"""
+
+
+
+# ... (rest of the imports and configurations remain the same)
+
+# Initialize ADLSManager
+adls_manager = ADLSManager()
+
+
+
+def encode_image(image_path):
+    with open(image_path, "rb") as image_file:
+        return base64.b64encode(image_file.read()).decode("utf-8")
+
+def pdf_to_base64_images(pdf_path, output_dir):
+    pdf_document = fitz.open(pdf_path)
+    base64_images = []
+
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    total_pages = len(pdf_document)
+
+    for page_num in range(total_pages):
+        page = pdf_document.load_page(page_num)
+        pix = page.get_pixmap()
+        img = Image.open(io.BytesIO(pix.tobytes()))
+        temp_image_path = os.path.join(output_dir, f"page_{page_num}.png")
+        img.save(temp_image_path, format="PNG")
+        base64_image = encode_image(temp_image_path)
+        base64_images.append(base64_image)
+        os.remove(temp_image_path)  # Remove the temporary image file
+
+    return base64_images
+
+class OutputStructure(BaseModel):
+    text: str
+    image_insights: str
+
+def analyze_document_structure(pdf_path):
+    reader = PdfReader(pdf_path)
+    full_text = ""
+    for page in reader.pages:
+        full_text += page.extract_text()
+
+    messages = [
+        {"role": "system", "content": document_structure_analyzer_prompt},
+        {"role": "user", "content": full_text}
+    ]
+
+    document_structure_analysis = inference_aoai(messages, aoai_deployment)
+    return document_structure_analysis.choices[0].message.content
+
+def process_image(image, page_num, source_filename, document_structure):
+    messages = [
+        {
+            "role": "system",
+            "content": f"{image_prompt}"
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": f"source_filename: {source_filename}\npage_number: {page_num}\n\nDocument Structure Analysis:\n{document_structure}"},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image}", "detail": "high"}}
+            ]
+        }
+    ]
+    
+    raw_response = inference_structured_output_aoai(messages, aoai_deployment, OutputStructure)
+    if raw_response:
+        response = OutputStructure(**raw_response.choices[0].message.parsed.dict())
+        print(f"Processed page {page_num}")
+        #print(f"Text: {response.text}")
+        print(f"Image Insights: {response.image_insights}")
+        return response
+    else:
+        print(f"Failed to process page {page_num}")
+        return None
+
+def create_consolidated_markdown(processed_pages):
+    consolidated_output = ""
+    for page_num, page_data in enumerate(processed_pages, start=1):
+        consolidated_output += page_data.text + "\n\n"
+        if page_data.image_insights != 'na':
+            consolidated_output += f"Image Insights: {page_data.image_insights}\n\n"
+        consolidated_output += f"<Page {page_num}>\n\n"
+        consolidated_output += "---\n\n"  # Add a separator between pages
+    return consolidated_output
+
+def main(input_path, filename, container):
+    # Use the new download_blob method from ADLSManager
+    temp_file_path = os.path.join(input_path, "temp", filename)
+    os.makedirs(os.path.dirname(temp_file_path), exist_ok=True)
+    
+    download_result = adls_manager.download_blob(filename, temp_file_path, container)
+    print(download_result['message'])
+    
+    input_file = temp_file_path
+    
+    # Analyze document structure
+    document_structure = analyze_document_structure(input_file)
+    print("Document Structure Analysis:")
+    print(document_structure)
+    
+    # Create output folder based on the filename
+    base_name = os.path.splitext(filename)[0]
+    output_image_folder = os.path.join(input_path, f"{base_name}_images")
+    
+    # Create the folder if it doesn't exist
+    os.makedirs(output_image_folder, exist_ok=True)
+    
+    # Convert PDF to images and save them in the output_image_folder
+    base64_images = pdf_to_base64_images(input_file, output_image_folder)
+
+    # Process each image and accumulate results in memory
+    processed_pages = []
+    for page_num, image in enumerate(base64_images, start=1):
+        page_result = process_image(image, page_num, filename, document_structure)
+        if page_result:
+            processed_pages.append(page_result)
+
+    # Create consolidated markdown content
+    consolidated_markdown = create_consolidated_markdown(processed_pages)
+
+    # Save the consolidated markdown to a file
+    output_file = os.path.join(input_path, f"{base_name}_consolidated.md")
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write(consolidated_markdown)
+
+    print(f"Processing complete. Consolidated results saved to {output_file}")
+    
+    # Clean up the temporary file
+    os.remove(temp_file_path)
+
+if __name__ == "__main__":
+    # Hardcode the path and filename here
+    input_path = "C:/temp/data/djg"
+    filename = "337 Goldman Drive.pdf"
+    container = 'djg'
+    
+    main(input_path, filename, container)
+--------------------------------------------------------------------------------
+<File: reusable_samples\langchain\langchain_functions.py>
+"""
+
+langchain==0.3.0
+langchain-core==0.3.1
+langchain-openai==0.2.0
+langchain-text-splitters==0.3.0
+
+"""
+
+
+from langchain_openai import AzureChatOpenAI
+import os
+from dotenv import load_dotenv
+from langchain_core.output_parsers import JsonOutputParser
+import json
+from langchain_core.messages import HumanMessage
+from langchain_core.tools import tool
+
+
+
+load_dotenv()
+
+
+# Azure OpenAI configuration
+aoai_deployment = os.getenv("AOAI_DEPLOYMENT_NAME")
+aoai_key = os.getenv("AOAI_API_KEY")
+aoai_endpoint = os.getenv("AOAI_ENDPOINT")
+
+
+# Initialize LangChain Azure Chat OpenAI
+llm_aoai = AzureChatOpenAI(
+    azure_deployment=aoai_deployment,
+    api_version="2024-08-01-preview",
+    temperature=0,
+    max_tokens=None,
+    timeout=None,
+    max_retries=2,
+    api_key=aoai_key,
+    azure_endpoint=aoai_endpoint
+)
+
+def _extract_country_names_streaming(input_stream):
+    """A function that operates on input streams."""
+    country_names_so_far = set()
+
+    for input in input_stream:
+        if not isinstance(input, dict):
+            continue
+
+        if "countries" not in input:
+            continue
+
+        countries = input["countries"]
+
+        if not isinstance(countries, list):
+            continue
+
+        for country in countries:
+            name = country.get("name")
+            if not name:
+                continue
+            if name not in country_names_so_far:
+                yield name
+                country_names_so_far.add(name)
+
+@tool
+def add(a: int, b: int) -> int:
+    """Add two integers.
+
+    Args:
+        a: First integer
+        b: Second integer
+    """
+    return a + b
+
+@tool
+def multiply(a: int, b: int) -> int:
+    """Multiply two integers.
+
+    Args:
+        a: First integer
+        b: Second integer
+    """
+    return a * b
+
+def basic_inference_example(llm):
+    messages = [
+        {"role": "system", "content": "You are a helpful AI assistant"},
+        {"role": "user", "content": "What color is the sky?"},
+    ]
+    response = llm.invoke(messages)
+    print("Basic Inference Response:")
+    print(response.content)
+    print(response.usage_metadata)
+
+def streaming_inference_example(llm):
+    messages = [
+        {"role": "system", "content": "You are a helpful AI assistant"},
+        {"role": "user", "content": "What color is the sky?"},
+    ]
+    print("\nStreaming Inference Response:")
+    response = llm.stream(messages)
+    for chunk in response:
+        print(chunk.content, end="|", flush=True)
+    print('\n')
+
+def json_parsing_example(llm):
+    chain = llm | JsonOutputParser() | _extract_country_names_streaming
+    
+    print("\nJSON Parsing and Streaming Example:")
+    for text in chain.stream(
+        "Output a list of the countries France, Spain, and Japan and their populations in JSON format. "
+        'Use a dict with an outer key of "countries" which contains a list of countries. '
+        "Each country should have the keys `name` and `population`"
+    ):
+        print(text, end="|", flush=True)
+    print('\n')
+
+@tool
+def add(a: int, b: int) -> int:
+    """Add two integers."""
+    return a + b
+
+@tool
+def multiply(a: int, b: int) -> int:
+    """Multiply two integers."""
+    return a * b
+
+def tool_calling_example(llm):
+    tools = [add, multiply]
+    llm_with_tools = llm.bind_tools(tools)
+    
+    print("\nTool Calling Example:")
+    query = "What is 3 * 12? Also, what is 114 + 49?"
+    
+    messages = [HumanMessage(query)]
+    ai_msg = llm_with_tools.invoke(messages)
+    
+    print("Tool Calls:")
+    print(ai_msg.tool_calls)
+    
+    messages.append(ai_msg)
+    
+    # Invoke the tools
+    for tool_call in ai_msg.tool_calls:
+        selected_tool = {"add": add, "multiply": multiply}[tool_call["name"].lower()]
+        tool_msg = selected_tool.invoke(tool_call)
+        messages.append(tool_msg)
+    
+    # Have LLM answer the question with the tool outputs
+    final_ai_msg = llm_with_tools.invoke(messages)
+    print("\nFinal Answer:")
+    print(final_ai_msg.content)
+
+def run_examples():
+    
+    #Basic inference
+    basic_inference_example(llm_aoai)
+
+    #Streaming inference
+    streaming_inference_example(llm_aoai)
+    
+    #Streaming & parsing JSON
+    json_parsing_example(llm_aoai)
+
+    #Tool calling
+    tool_calling_example(llm_aoai)
+
+if __name__ == "__main__":
+    run_examples()
+--------------------------------------------------------------------------------
+<File: reusable_samples\scripts\getcodebase.py>
+"""
+File Processing Script for AI-assisted coding
+
+This script processes multiple code files and combines their contents into a single output file,
+making it easier to use with AI-powered code analysis tools or language models.
+
+Features:
+- Process individual files or entire directories recursively
+- Filter files based on allowed extensions
+- Combine file contents into a single output file with clear separators
+- Flexible mode selection: 'files' for specific files, 'folders' for directory processing
+
+Usage:
+1. Run the script: python script_name.py
+2. Choose the processing mode:
+   - 'files': Process specific files listed in `files_to_process`
+   - 'folders': Process directories recursively
+3. If 'folders' mode is selected, choose between:
+   - 'root': Process the entire project directory
+   - Enter: Process predefined folders listed in `folders_to_process`
+4. The script will create 'codebase.txt' containing the processed file contents
+
+Configuration:
+- output_filename: Name of the output file (default: 'codebase.txt')
+- separator: String used to separate file contents (default: 80 dashes)
+- allowed_extensions: List of file extensions to process
+- folders_to_process: List of folders to process in 'folders' mode
+- files_to_process: List of specific files to process in 'files' mode
+
+Note: Ensure you have the necessary permissions to read the input files and write to the output file.
+"""
+
+
+import os
+from typing import List, TextIO
+
+def is_allowed_extension(file: str, allowed_extensions: List[str]) -> bool:
+    """
+    Check if the file has an allowed extension.
+
+    Args:
+        file (str): The filename to check.
+        allowed_extensions (List[str]): List of allowed file extensions.
+
+    Returns:
+        bool: True if the file has an allowed extension, False otherwise.
+    """
+    return any(file.lower().endswith(ext) for ext in allowed_extensions)
+
+def process_file(file_path: str, output_file: TextIO, separator: str) -> None:
+    """
+    Process a single file and write its contents to the output file.
+
+    Args:
+        file_path (str): Path to the file to process.
+        output_file (TextIO): The output file object to write to.
+        separator (str): The separator string to use between files.
+
+    Raises:
+        Exception: If there's an error reading or writing the file.
+    """
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+            output_file.write(f"<{file_path}>\n{content}\n{separator}\n\n\n")
+        print(f"Processed: {file_path}")
+    except Exception as e:
+        print(f"Error processing {file_path}: {e}")
+
+def process_directory(directory: str, output_file: TextIO, separator: str, allowed_extensions: List[str]) -> None:
+    """
+    Recursively process all files in a directory with allowed extensions.
+
+    Args:
+        directory (str): The directory to process.
+        output_file (TextIO): The output file object to write to.
+        separator (str): The separator string to use between files.
+        allowed_extensions (List[str]): List of allowed file extensions.
+    """
+    for root, _, files in os.walk(directory):
+        for file in files:
+            if is_allowed_extension(file, allowed_extensions):
+                file_path = os.path.join(root, file)
+                process_file(file_path, output_file, separator)
+
+def main():
+    """
+    Main function to run the file processing script.
+    """
+    # Configuration
+    output_filename = 'D:/temp/tmp_codebase/codebase.txt'
+    separator = '-' * 80  # 80 dashes as a separator
+    allowed_extensions = ['.py', '.json', '.md', '.env']
+
+    # Hardcoded lists
+    folders_to_process = ['D:/projects/samples/reusable_samples']
+    files_to_process = [
+        'ai_search.py',
+        'aoai.py',
+        'adls.py',
+        'cosmosdb.py',
+        'document_intelligence.py'
+
+    ]
+
+    print(f"Current working directory: {os.getcwd()}")
+
+    # Choose mode
+    mode = input("Enter 'files' for specific files or 'folders' for recursive folder processing: ").strip().lower()
+
+    with open(output_filename, 'w', encoding='utf-8') as output_file:
+        if mode == 'files':
+            for file_path in files_to_process:
+                if os.path.isfile(file_path):
+                    process_file(file_path, output_file, separator)
+                else:
+                    print(f"File not found: {file_path}")
+        elif mode == 'folders':
+            root_option = input("Enter 'root' to process the entire project, or press Enter to use predefined folders: ").strip().lower()
+            if root_option == 'root':
+                process_directory('.', output_file, separator, allowed_extensions)
+            else:
+                for folder in folders_to_process:
+                    if os.path.isdir(folder):
+                        print(f"Processing folder: {folder}")
+                        process_directory(folder, output_file, separator, allowed_extensions)
+                    else:
+                        print(f"Directory not found: {folder}")
+        else:
+            print("Invalid mode selected. Please run the script again and choose 'files' or 'folders'.")
+
+    print(f"File contents have been written to {output_filename}")
+
+if __name__ == "__main__":
+    main()
+--------------------------------------------------------------------------------
+<File: reusable_samples\storage\adls.py>
+"""
+### adls.py ###
+
+This module handles interactions with Azure Data Lake Storage Gen2 (which is built on Azure Blob Storage).
+It provides functionality to upload files, list blobs, and move blobs between containers. The goal of this module is to provide 
+clear and concise examples of how to run basic ADLS operations using a particular SDK version. 
+
+Requirements:
+    azure-storage-blob==12.22.0
+
+"""
+
+import os
+from typing import Union, Dict, Any, List
+from dotenv import load_dotenv
+from azure.storage.blob import BlobServiceClient
+from azure.identity import DefaultAzureCredential
+import io
+
+class ADLSManager:
+    def __init__(self, storage_account_name=None, storage_account_container=None):
+        """
+        Initialize the ADLSManager with environment variables and blob service client.
+        """
+        self._load_env_variables(storage_account_name, storage_account_container)
+        self.blob_service_client = self._get_blob_service_client()
+
+    def _load_env_variables(self, storage_account_name=None, storage_account_container=None):
+        """
+        Load environment variables required for Azure Data Lake Storage operations.
+        """
+        load_dotenv()
+        self.storage_account_name = storage_account_name or os.environ.get("STORAGE_ACCOUNT_NAME")
+        self.storage_account_key = os.environ.get("STORAGE_ACCOUNT_KEY")
+        self.storage_account_container = storage_account_container or os.environ.get("STORAGE_ACCOUNT_CONTAINER", "documents")
+        self.tenant_id = os.environ.get("TENANT_ID", '16b3c013-d300-468d-ac64-7eda0820b6d3')
+
+        if not self.storage_account_name:
+            raise ValueError("STORAGE_ACCOUNT_NAME must be provided or set as an environment variable")
+
+    def _get_blob_service_client(self) -> BlobServiceClient:
+        """
+        Get the Blob Service Client using either key-based authentication or DefaultAzureCredential.
+
+        Returns:
+            BlobServiceClient: The initialized Blob Service Client.
+        """
+        print("Initializing Blob service client")
+        if self.storage_account_key:
+            print("Using key-based authentication for Blob storage")
+            connection_string = f"DefaultEndpointsProtocol=https;AccountName={self.storage_account_name};AccountKey={self.storage_account_key};EndpointSuffix=core.windows.net"
+            return BlobServiceClient.from_connection_string(connection_string)
+        else:
+            print("Using DefaultAzureCredential for Blob storage authentication")
+            account_url = f"https://{self.storage_account_name}.blob.core.windows.net"
+            credential = DefaultAzureCredential(
+                interactive_browser_tenant_id=self.tenant_id,
+                visual_studio_code_tenant_id=self.tenant_id,
+                workload_identity_tenant_id=self.tenant_id,
+                shared_cache_tenant_id=self.tenant_id
+            )
+            return BlobServiceClient(account_url=account_url, credential=credential)
+
+    def upload_to_blob(self, file_content: Union[bytes, io.IOBase], filename: str, container_name: str = None) -> Dict[str, str]:
+        """
+        Upload a file to Azure Blob Storage.
+
+        Args:
+            file_content (Union[bytes, io.IOBase]): The content of the file to upload.
+            filename (str): The name of the file in the blob storage.
+            container_name (str, optional): The name of the container to upload to. Defaults to self.storage_account_container.
+
+        Returns:
+            Dict[str, str]: A dictionary containing the upload message and the blob URL.
+        """
+        container_name = container_name or self.storage_account_container
+        container_client = self.blob_service_client.get_container_client(container_name)
+        blob_client = container_client.get_blob_client(filename)
+        
+        if isinstance(file_content, io.IOBase):
+            blob_client.upload_blob(file_content.read(), overwrite=True)
+        else:
+            blob_client.upload_blob(file_content, overwrite=True)
+        
+        print(f"File {filename} uploaded successfully")
+        return {"message": f"File {filename} uploaded successfully", "blob_url": blob_client.url}
+
+    def list_blobs_in_folder(self, folder_name: str, container_name: str = None) -> List[Any]:
+        """
+        List all blobs in a specified folder within a container.
+
+        Args:
+            folder_name (str): The name of the folder to list blobs from.
+            container_name (str, optional): The name of the container. Defaults to self.storage_account_container.
+
+        Returns:
+            List[Any]: A list of blob objects in the specified folder.
+        """
+        container_name = container_name or self.storage_account_container
+        container_client = self.blob_service_client.get_container_client(container_name)
+        
+        return [blob for blob in container_client.list_blobs() if blob.name.startswith(folder_name)]
+
+    def move_blob(self, source_blob_name: str, 
+                  destination_blob_name: str, 
+                  source_container_name: str = None, 
+                  destination_container_name: str = None) -> Dict[str, str]:
+        """
+        Move a blob from one location to another within Azure Blob Storage.
+
+        Args:
+            source_blob_name (str): The name of the source blob.
+            destination_blob_name (str): The name of the destination blob.
+            source_container_name (str, optional): The name of the source container. Defaults to self.storage_account_container.
+            destination_container_name (str, optional): The name of the destination container. Defaults to source_container_name.
+
+        Returns:
+            Dict[str, str]: A dictionary containing the move message.
+        """
+        source_container_name = source_container_name or self.storage_account_container
+        destination_container_name = destination_container_name or source_container_name
+
+        source_container_client = self.blob_service_client.get_container_client(source_container_name)
+        destination_container_client = self.blob_service_client.get_container_client(destination_container_name)
+
+        source_blob = source_container_client.get_blob_client(source_blob_name)
+        destination_blob = destination_container_client.get_blob_client(destination_blob_name)
+        
+        destination_blob.start_copy_from_url(source_blob.url)
+        source_blob.delete_blob()
+        message = f"Moved blob from {source_blob_name} to {destination_blob_name}"
+        print(message)
+        return {"message": message}
+    
+    def download_blob(self, blob_name: str, download_path: str, container_name: str = None) -> Dict[str, str]:
+        """
+        Download a blob from Azure Blob Storage to a local file.
+
+        Args:
+            blob_name (str): The name of the blob to download.
+            download_path (str): The local path where the file should be downloaded.
+            container_name (str, optional): The name of the container. Defaults to self.storage_account_container.
+
+        Returns:
+            Dict[str, str]: A dictionary containing the download message and the local file path.
+        """
+        container_name = container_name or self.storage_account_container
+        container_client = self.blob_service_client.get_container_client(container_name)
+        blob_client = container_client.get_blob_client(blob_name)
+
+        os.makedirs(os.path.dirname(download_path), exist_ok=True)
+        
+        with open(download_path, "wb") as download_file:
+            download_file.write(blob_client.download_blob().readall())
+        
+        message = f"Blob {blob_name} downloaded successfully to {download_path}"
+        print(message)
+        return {"message": message, "local_path": download_path}
+
+def example_upload_local_file(sample_file_path):
+    """Example usage of upload_to_blob function for uploading a local file."""
+    adls_manager = ADLSManager()
+    print("Uploading local file...")
+    with open(sample_file_path, 'rb') as file:
+        upload_result = adls_manager.upload_to_blob(file, os.path.basename(sample_file_path))
+    print(f"Local file upload: {upload_result['message']}")
+
+def example_upload_bytestream(sample_file_path):
+    """Example usage of upload_to_blob function for uploading a file as bytestream."""
+    adls_manager = ADLSManager()
+    print("Uploading file as bytestream...")
+    with open(sample_file_path, 'rb') as file:
+        file_content = file.read()
+    upload_result = adls_manager.upload_to_blob(file_content, "bytestream_" + os.path.basename(sample_file_path))
+    print(f"Bytestream upload: {upload_result['message']}")
+
+def example_list_blobs():
+    """Example usage of list_blobs_in_folder function."""
+    adls_manager = ADLSManager()
+    print("Listing blobs in 'source' folder...")
+    blobs = adls_manager.list_blobs_in_folder("source/")
+    print(f"Found {len(blobs)} blobs in the 'source' folder")
+    return blobs
+
+def example_move_blob(blobs):
+    """Example usage of move_blob function."""
+    adls_manager = ADLSManager()
+    if blobs:
+        source_blob_name = blobs[0].name
+        destination_blob_name = source_blob_name.replace("source/", "processed/")
+        print(f"Moving blob {source_blob_name} to {destination_blob_name}...")
+        move_result = adls_manager.move_blob(source_blob_name, destination_blob_name)
+        print(move_result['message'])
+
+def example_download_blob(blob_name, download_path):
+    """Example usage of download_blob function."""
+    adls_manager = ADLSManager()
+    print(f"Downloading blob {blob_name} to {download_path}...")
+    download_result = adls_manager.download_blob(blob_name, download_path)
+    print(download_result['message'])
+
+if __name__ == "__main__":
+    sample_file_path = "D:/temp/djg/337 Goldman Drive Inspection Report 20230730.pdf"
+    
+    # example_upload_local_file(sample_file_path)
+    # example_upload_bytestream(sample_file_path)
+    # blobs = example_list_blobs()
+    # example_move_blob(blobs)
+    example_download_blob("337 Goldman Drive Inspection Report 20230730.pdf", "D:/temp/337 Goldman Drive Inspection Report 20230730.pdf")
+--------------------------------------------------------------------------------

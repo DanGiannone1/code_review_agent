@@ -1,0 +1,11 @@
+python-dotenv
+azure-cosmos
+openai
+Flask
+flask-cors
+langchain
+langchain-openai
+azure-identity
+gunicorn
+flask-limiter
+azure-search-documents==11.4.0
